@@ -1,11 +1,9 @@
 #![allow(non_snake_case)]
-use tokio::net::TcpListener;
-//use tokio::prelude::*;
+use futures::try_join;
+use tokio::net::{TcpStream, TcpListener};
 use std::net::IpAddr;
 use std::io::{Read, Cursor, Seek};
 use byteorder::{NetworkEndian, ReadBytesExt};
-
-//use chrono::Utc;
 
 struct Connect {
     ver: u8,
@@ -14,7 +12,6 @@ struct Connect {
 
 async fn readConnect(socket: &mut tokio::net::TcpStream) -> Option<Connect> {
     let mut buf = [0; 258];
-    //let n = match socket.read(&mut buf).await {
     let n = match tokio::io::AsyncReadExt::read(socket, &mut buf).await {
         Ok(n) if n < 3 => {
             println!("Too few bytes received: {:?}", n);
@@ -81,10 +78,10 @@ impl Addr {
                 cur.read_exact(&mut buf)?;
                 match String::from_utf8(buf) {
                    Ok(name) => Ok(Addr::Domain(name)),
-                   Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))) 
+                   Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
                 }
             },
-            e => Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid address type {:02x}", e))) 
+            e => Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid address type {:02x}", e)))
         };
     }
 }
@@ -98,7 +95,6 @@ struct Request {
 
 async fn readRequest(socket: &mut tokio::net::TcpStream) -> std::io::Result<Request> {
     let mut buf = [0; 260];
-    //let n = match socket.read(&mut buf).await {
     let n = match tokio::io::AsyncReadExt::read(socket, &mut buf).await {
         Ok(n) if n < 7 => {
             return Err(std::io::Error::new(
@@ -129,6 +125,66 @@ async fn readRequest(socket: &mut tokio::net::TcpStream) -> std::io::Result<Requ
     return Ok(Request{cmd, addr, port});
 }
 
+async fn handleConnection(mut socket: &mut TcpStream) -> tokio::io::Result<()> {
+    let connect = match readConnect(&mut socket).await {
+        None => return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "Connection read failed")),
+        Some(connect) => connect
+    };
+    println!("VER={:02x} METHODS={:?}", connect.ver, connect.methods);
+
+    // FIXME check for 0x05 and method==0
+    //
+
+    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut socket, &[0x05u8,0x00]).await {
+        return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
+    }
+
+    let request = match readRequest(&mut socket).await {
+        Err(e) =>
+            return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("Request read failed: {:?}", e))),
+        Ok(request) => request
+    };
+    println!("Request: {:?}", request);
+
+    /* FIXME wtf
+    let remote_addr = match request.addr {
+        Addr::Ip(ip) => { return ; }, //(&ip.to_string(), request.port),
+        Addr::Domain(d) => (&d, request.port)
+    };
+    */
+
+    let mut outgoing = match request.addr {
+        Addr::Ip(_) =>
+            return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "Ip not implemented FIXME wtf rust")),
+        Addr::Domain(d) => {
+            let remote_addr = format!("{}:{}", d, request.port);
+            match TcpStream::connect(&remote_addr).await {
+                Err(e) =>
+                    return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("Connect to {:?} failed: {:?}", remote_addr, e))),
+                Ok(socket) => socket
+            }
+        }
+    };
+
+    println!("Connected");
+
+    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut socket, &[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).await {
+        return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
+    }
+
+
+    let (mut ri, mut wi) = socket.split();
+    let (mut ro, mut wo) = outgoing.split();
+
+    let client_to_server = tokio::io::copy(&mut ri, &mut wo);
+    let server_to_client = tokio::io::copy(&mut ro, &mut wi);
+
+    // TODO on error
+    let _ = try_join!(client_to_server, server_to_client);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listener = TcpListener::bind("127.0.0.1:10000").await?;
@@ -137,39 +193,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (mut socket, _) = listener.accept().await?;
 
         tokio::spawn(async move {
-            let connect = match readConnect(&mut socket).await {
-                None => {
-                    println!("Connection read failed");
-                    return;
-                },
-                Some(connect) => connect
-            };
-            println!("VER={:02x} METHODS={:?}", connect.ver, connect.methods);
-
-            // FIXME check for 0x05 and method==0
-            //
-
-            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut socket, &[0x05u8,0x00]).await {
-                eprintln!("socket write error: {:?}", e);
-                return;
+            match handleConnection(&mut socket).await {
+                Err(e) => println!("Connection error: {:?}", e),
+                Ok(_) => {}
             }
-
-            let request = match readRequest(&mut socket).await {
-                Err(e) => {
-                    println!("Request read failed: {:?}", e);
-                    return;
-                },
-                Ok(request) => request 
-            };
-            println!("Request: {:?}", request);
-            //println!("Request cmd: {:?}, addr: {:?}, port: {}", request.cmd, request.addr, request.port);
-
-            /*
-            let time = Utc::now().to_rfc2822();
-            if let Err(e) = socket.write_all(&time.into_bytes()[..]).await {
-                eprintln!("socket write error: {:?}", e);
-            }
-            */
         });
     }
 }
