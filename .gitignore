@@ -1,4 +1,6 @@
 /target
+/target-install
 **/*.rs.bk
 *.lock
 *.swp
+core
