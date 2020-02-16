@@ -22,8 +22,7 @@ impl std::fmt::Display for SimpleError {
 
 impl std::error::Error for SimpleError {}
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = clap::App::new("SUCKS")
         .setting(clap::AppSettings::SubcommandRequiredElseHelp)
         .subcommand(clap::SubCommand::with_name("exit")
@@ -38,13 +37,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(cmd) = args.subcommand_matches("socks") {
         let exit = cmd.value_of("exit").unwrap();
         let listen = cmd.value_of("listen").unwrap();
-        socks::main(listen, exit).await?
+        socks::main(listen, exit)?
     }
 
+    /*
     if let Some(cmd) = args.subcommand_matches("exit") {
         let listen = cmd.value_of("listen").unwrap();
         exit::main(listen).await?
     }
+    */
 
     let err : Box<dyn std::error::Error> = Box::new(SimpleError::new("Not implemented"));
     Err(err)

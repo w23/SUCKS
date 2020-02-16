@@ -1,34 +1,43 @@
-use std::io::{Read, Cursor, Seek};
-use std::net::IpAddr;
-use futures::try_join;
+use {
+    std::{
+        io::{Write, Read, Cursor, Seek},
+        net::{IpAddr, ToSocketAddrs},
+    },
+    mio::{
+        Events, Poll, PollOpt, Ready, Token,
+        net::{
+            //UdpSocket,
+            TcpStream, TcpListener,
+        },
+    },
+    slab::Slab,
+};
 use byteorder::{NetworkEndian, ReadBytesExt};
-use tokio::net::{UdpSocket, TcpStream, TcpListener};
 
 struct Connect {
     ver: u8,
     methods: Vec<u8>
 }
 
-async fn readConnect(socket: &mut tokio::net::TcpStream) -> Option<Connect> {
+fn readConnect(stream: &mut TcpStream) -> Result<Connect, std::io::Error> {
     let mut buf = [0; 258];
-    let n = match tokio::io::AsyncReadExt::read(socket, &mut buf).await {
+    let n = match stream.read(&mut buf) {
         Ok(n) if n < 3 => {
-            println!("Too few bytes received: {:?}", n);
-            return None;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Too few bytes received: {:?}", n)));
         },
         Ok(n) => n,
-        Err(e) => {
-            println!("Error reading request: {:?}", e);
-            return None;
-        }
+        Err(e) => return Err(e),
     };
 
     if (n-2) as u8 != buf[1] {
-        println!("Methods and size mismatch: {} vs {}", n-2, buf[1]);
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Methods and size mismatch: {} vs {}", n-2, buf[1])));
     }
 
-    return Some(Connect{
+    return Ok(Connect{
         ver: buf[0],
         methods: buf[2..][0..buf[1] as usize].to_vec(),
     });
@@ -92,16 +101,32 @@ struct Request {
     port: u16
 }
 
-async fn readRequest(socket: &mut tokio::net::TcpStream) -> std::io::Result<Request> {
+impl Request {
+    // FIXME return:
+    // - result
+    // - vec[]
+    fn socket_addr(&self) -> std::net::SocketAddr {
+        match &self.addr {
+            Addr::Ip(ip) =>
+                std::net::SocketAddr::new(*ip, self.port),
+            Addr::Domain(d) => {
+                let mut addrs_iter = format!("{}:{}", d, self.port).to_socket_addrs().unwrap();
+                addrs_iter.next().unwrap()
+            }
+        }
+    }
+}
+
+fn readRequest(stream: &mut TcpStream) -> std::io::Result<Request> {
     let mut buf = [0; 260];
-    let n = match tokio::io::AsyncReadExt::read(socket, &mut buf).await {
+    let n = match stream.read(&mut buf) {
         Ok(n) if n < 7 => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!("Too few bytes received: {:?}", n)));
         },
         Ok(n) => n,
-        Err(e) => return Err(e)
+        Err(e) => return Err(e) // FIXME WouldBlock
     };
 
     let buf = &buf[0..n];
@@ -124,80 +149,133 @@ async fn readRequest(socket: &mut tokio::net::TcpStream) -> std::io::Result<Requ
     return Ok(Request{cmd, addr, port});
 }
 
-async fn handleConnection(mut socket: &mut TcpStream) -> tokio::io::Result<()> {
-    let connect = match readConnect(&mut socket).await {
-        None => return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "Connection read failed")),
-        Some(connect) => connect
-    };
-    println!("VER={:02x} METHODS={:?}", connect.ver, connect.methods);
+const MAX_CONNECTIONS: usize = 32;
 
-    // FIXME check for 0x05 and method==0
-    //
-
-    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut socket, &[0x05u8,0x00]).await {
-        return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
-    }
-
-    let request = match readRequest(&mut socket).await {
-        Err(e) =>
-            return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("Request read failed: {:?}", e))),
-        Ok(request) => request
-    };
-    println!("Request: {:?}", request);
-
-    /* FIXME wtf
-    let remote_addr = match request.addr {
-        Addr::Ip(ip) => { return ; }, //(&ip.to_string(), request.port),
-        Addr::Domain(d) => (&d, request.port)
-    };
-    */
-
-    let mut outgoing = match request.addr {
-        Addr::Ip(_) =>
-            return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "Ip not implemented FIXME wtf rust")),
-        Addr::Domain(d) => {
-            let remote_addr = format!("{}:{}", d, request.port);
-            match TcpStream::connect(&remote_addr).await {
-                Err(e) =>
-                    return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("Connect to {:?} failed: {:?}", remote_addr, e))),
-                Ok(socket) => socket
-            }
-        }
-    };
-
-    println!("Connected");
-
-    // 2. Reply to client
-    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut socket, &[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).await {
-        return Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
-    }
-
-    // 3. Maintain connection
-    // 3.1 Send request to exit node
-
-    let (mut ri, mut wi) = socket.split();
-    let (mut ro, mut wo) = outgoing.split();
-
-    let client_to_server = tokio::io::copy(&mut ri, &mut wo);
-    let server_to_client = tokio::io::copy(&mut ro, &mut wi);
-
-    // TODO on error
-    let _ = try_join!(client_to_server, server_to_client);
-
-    Ok(())
+struct ConnectionContext<'a> {
+    index: usize,
+    token: usize,
+    poll: &'a Poll,
 }
 
-pub async fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut listener = TcpListener::bind(listen).await?;
+impl<'a> ConnectionContext<'a> {
+    fn new(index: usize, token: usize, poll: &'a Poll) -> ConnectionContext<'a> {
+        ConnectionContext { index, token, poll }
+    }
+
+    fn register<'b>(&'a self, token: usize, stream: &'b TcpStream) -> Result<(), std::io::Error> {
+        self.poll.register(stream,
+            Token(self.index + token * MAX_CONNECTIONS),
+            Ready::readable() | Ready::writable(), PollOpt::edge())
+    }
+}
+
+struct Connection {
+    client_stream: TcpStream,
+    test_remote_stream: Option<TcpStream>,
+    //exit_socket: UdpSocket,
+
+    handle_client_stream: fn(&mut Connection, &ConnectionContext) -> Result<(), std::io::Error>,
+}
+
+impl Connection {
+    fn new(stream: TcpStream) -> Connection {
+        Connection {
+            client_stream: stream,
+            test_remote_stream: None,
+            handle_client_stream: Connection::handleClientNewConnection
+        }
+    }
+
+    fn handle(&mut self, ctx: &ConnectionContext) -> Result<(), std::io::Error> {
+        match (self.handle_client_stream)(self, ctx) {
+            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                // FIXME what to do?
+                Err(e)
+            },
+            _ => Ok(())
+        }
+    }
+
+    fn handleClientNewConnection(&mut self, _ctx: &ConnectionContext) -> Result<(), std::io::Error> {
+        let connect = readConnect(&mut self.client_stream)?;
+        println!("VER={:02x} METHODS={:?}", connect.ver, connect.methods);
+        // FIXME check for 0x05 and method==0
+
+        // FIXME check for wouldblock ?
+        if let Err(e) = self.client_stream.write(&[0x05u8,0x00]) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
+        }
+
+        self.handle_client_stream = Connection::handleClientRequest;
+        Ok(())
+    }
+
+    fn handleClientRequest(&mut self, ctx: &ConnectionContext) -> Result<(), std::io::Error> {
+        let request = readRequest(&mut self.client_stream)?;
+        println!("Request: {:?}", request);
+
+        match request.cmd {
+            Command::Connect => {},
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Command {:?} not implemented", request.cmd)))
+        }
+
+        let remote_addr = request.socket_addr();
+        self.test_remote_stream = Some(TcpStream::connect(&remote_addr)?);
+        ctx.register(1, self.test_remote_stream.as_ref().unwrap())?;
+
+        // Reply to client
+        // FIXME WouldBlock
+        if let Err(e) = self.client_stream.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
+        }
+
+        self.handle_client_stream = Connection::handleClientData;
+        Ok(())
+    }
+
+    fn handleClientData(&mut self, _ctx: &ConnectionContext) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Not implemented"))
+    }
+}
+
+const LISTENER: Token = Token(0);
+
+pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let poll = Poll::new()?;
+    let mut events = Events::with_capacity(128);
+
+    let listen_addr = listen.parse()?;
+    let listener = TcpListener::bind(&listen_addr)?;
+    poll.register(&listener, LISTENER, Ready::readable(), PollOpt::edge())?;
+
+    let mut connections = Slab::<Connection>::with_capacity(MAX_CONNECTIONS);
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        poll.poll(&mut events, None).unwrap();
 
-        tokio::spawn(async move {
-            match handleConnection(&mut socket).await {
-                Err(e) => println!("Connection error: {:?}", e),
-                Ok(_) => {}
+        for event in &events {
+            match event.token() {
+                LISTENER => {
+                    match listener.accept() {
+                        Ok((socket, _)) => {
+                            println!("New socket: {:?}", socket);
+                            let token = Token(connections.insert(Connection::new(socket)) + 1);
+                            println!("Token {}", token.0);
+                            poll.register(&connections.get_mut(token.0-1).unwrap().client_stream, token,
+                                Ready::readable() | Ready::writable(), PollOpt::edge())?;
+                        },
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                        Err(e) => return Err(Box::new(e))
+                    }
+                },
+                Token(t) => {
+                    println!("Token {}", t);
+                    let index = (t - 1) % MAX_CONNECTIONS;
+                    let token = (t - 1) / MAX_CONNECTIONS;
+                    connections.get_mut(index).unwrap().handle(&ConnectionContext::new(index, token, &poll))?;
+                }
+                //token => panic!("what! {:?}", token)
             }
-        });
+        }
     }
 }
