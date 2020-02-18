@@ -164,17 +164,67 @@ impl<'a> ConnectionContext<'a> {
 
     fn register<'b>(&'a self, token: usize, stream: &'b TcpStream) -> Result<(), std::io::Error> {
         self.poll.register(stream,
-            Token(self.index + token * MAX_CONNECTIONS),
+            Token(self.index + token * MAX_CONNECTIONS + 1),
             Ready::readable() | Ready::writable(), PollOpt::edge())
     }
 }
 
+const TEST_BUFFER_SIZE: usize = 8192;
+
+struct RingByteBuffer {
+    buffer: [u8; TEST_BUFFER_SIZE],
+    write: usize,
+    read: usize,
+}
+
+impl RingByteBuffer {
+    fn new() -> RingByteBuffer {
+        RingByteBuffer {
+            buffer: [0; TEST_BUFFER_SIZE],
+            write: 0,
+            read: 0,
+        }
+    }
+
+    fn get_free_slot(&mut self) -> &mut [u8] {
+        if self.write >= self.read {
+            &mut self.buffer[self.write..]
+        } else {
+            &mut self.buffer[self.write..self.read - 1]
+        }
+    }
+
+    fn produce(&mut self, written: usize) {
+        // FIXME check written validity
+        self.write = (self.write + written) % self.buffer.len();
+    }
+
+    fn get_data(&self) -> &[u8] {
+        if self.write >= self.read {
+            &self.buffer[self.read..self.write]
+        } else {
+            &self.buffer[self.read..]
+        }
+    }
+
+    fn consume(&mut self, read: usize) {
+        // FIXME check read validity
+        self.read = (self.read + read) % self.buffer.len();
+    }
+}
+
+type ConnectionHandleFn = fn(&mut Connection, &ConnectionContext) -> Result<(), std::io::Error>;
+
 struct Connection {
     client_stream: TcpStream,
-    test_remote_stream: Option<TcpStream>,
     //exit_socket: UdpSocket,
 
-    handle_client_stream: fn(&mut Connection, &ConnectionContext) -> Result<(), std::io::Error>,
+    test_remote_stream: Option<TcpStream>,
+    test_to_remote: RingByteBuffer,
+    test_from_remote: RingByteBuffer,
+
+    handle_client_stream: ConnectionHandleFn,
+    test_handle_remote_stream: Option<ConnectionHandleFn>,
 }
 
 impl Connection {
@@ -182,12 +232,22 @@ impl Connection {
         Connection {
             client_stream: stream,
             test_remote_stream: None,
-            handle_client_stream: Connection::handleClientNewConnection
+            handle_client_stream: Connection::handleClientNewConnection,
+            test_handle_remote_stream: None,
+            test_to_remote: RingByteBuffer::new(),
+            test_from_remote: RingByteBuffer::new(),
         }
     }
 
     fn handle(&mut self, ctx: &ConnectionContext) -> Result<(), std::io::Error> {
-        match (self.handle_client_stream)(self, ctx) {
+        let handle: Option<ConnectionHandleFn> =
+            if ctx.token == 0 {
+                Some(self.handle_client_stream)
+            } else {
+                Some(*self.test_handle_remote_stream.as_ref().unwrap())
+            };
+
+        match (handle.unwrap())(self, ctx) {
             Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
                 // FIXME what to do?
                 Err(e)
@@ -221,12 +281,13 @@ impl Connection {
 
         let remote_addr = request.socket_addr();
         self.test_remote_stream = Some(TcpStream::connect(&remote_addr)?);
+        self.test_handle_remote_stream = Some(Connection::handleRemoteData);
         ctx.register(1, self.test_remote_stream.as_ref().unwrap())?;
 
         // Reply to client
         // FIXME WouldBlock
         if let Err(e) = self.client_stream.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
+           return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("socket write error: {:?}", e)))
         }
 
         self.handle_client_stream = Connection::handleClientData;
@@ -234,7 +295,43 @@ impl Connection {
     }
 
     fn handleClientData(&mut self, _ctx: &ConnectionContext) -> Result<(), std::io::Error> {
-        Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Not implemented"))
+        let read = self.client_stream.read(self.test_to_remote.get_free_slot())?;
+        self.test_to_remote.produce(read);
+        println!("cli->remote read={}", read);
+
+        let data = self.test_to_remote.get_data();
+        println!("data={}", data.len());
+        let written = self.test_remote_stream.as_ref().unwrap().write(data)?;
+        self.test_to_remote.consume(written);
+        println!("cli->remote wr={}", written);
+
+        Ok(())
+
+        //Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Not implemented"))
+    }
+
+    fn handleRemoteData(&mut self, _ctx: &ConnectionContext) -> Result<(), std::io::Error> {
+        { // FIXME DONT DO THIS
+            let data = self.test_to_remote.get_data();
+            println!("data={}", data.len());
+            match self.test_remote_stream.as_ref().unwrap().write(data) {
+                Ok(written) => {
+                    self.test_to_remote.consume(written);
+                    println!("cli->remote wr={}", written);
+                },
+                _ => {},
+            };
+        }
+
+        let read = self.test_remote_stream.as_mut().unwrap().read(self.test_from_remote.get_free_slot())?;
+        self.test_from_remote.produce(read);
+        println!("cli->remote read={}", read);
+
+        let written = self.client_stream.write(self.test_from_remote.get_data())?;
+        self.test_from_remote.consume(written);
+        println!("cli->remote wr={}", written);
+
+        Ok(())
     }
 }
 
@@ -251,9 +348,11 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
     let mut connections = Slab::<Connection>::with_capacity(MAX_CONNECTIONS);
 
     loop {
+        println!("loop");
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
+            println!("event: {:?}", event);
             match event.token() {
                 LISTENER => {
                     match listener.accept() {
@@ -269,9 +368,9 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
                     }
                 },
                 Token(t) => {
-                    println!("Token {}", t);
                     let index = (t - 1) % MAX_CONNECTIONS;
                     let token = (t - 1) / MAX_CONNECTIONS;
+                    println!("Token({}) -> index={}, token={}", t, index, token);
                     connections.get_mut(index).unwrap().handle(&ConnectionContext::new(index, token, &poll))?;
                 }
                 //token => panic!("what! {:?}", token)
