@@ -149,7 +149,7 @@ fn readRequest(stream: &mut TcpStream) -> std::io::Result<Request> {
     return Ok(Request{cmd, addr, port});
 }
 
-const MAX_CONNECTIONS: usize = 32;
+const MAX_CONNECTIONS: usize = 128;
 
 struct ConnectionContext<'a> {
     index: usize,
@@ -186,6 +186,14 @@ impl RingByteBuffer {
         }
     }
 
+    fn queue_size(&self) -> usize {
+        if self.write >= self.read {
+            self.write - self.read
+        } else {
+            self.buffer.len() - (self.read - self.write) - 1
+        }
+    }
+
     fn get_free_slot(&mut self) -> &mut [u8] {
         if self.write >= self.read {
             &mut self.buffer[self.write..]
@@ -211,6 +219,28 @@ impl RingByteBuffer {
         // FIXME check read validity
         self.read = (self.read + read) % self.buffer.len();
     }
+}
+
+fn transerfignRealnosti(src: &mut TcpStream, dst: &mut TcpStream, buf: &mut RingByteBuffer) -> Result<(), std::io::Error> {
+    println!("buffer size = {}", buf.queue_size());
+    match src.read(buf.get_free_slot()) {
+        Ok(read) => {
+            buf.produce(read);
+            println!("read={}", read);
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+        Err(e) => {
+            if buf.queue_size() == 0 {
+                unimplemented!("FIXME: handle {:?}", e);
+            }
+        }, // FIXME handle errors
+    };
+
+    let written = dst.write(buf.get_data())?; // FIXME handle wrapping: possible fake starvation
+    buf.consume(written);
+    println!("wr={}", written);
+
+    Ok(())
 }
 
 type ConnectionHandleFn = fn(&mut Connection, &ConnectionContext) -> Result<(), std::io::Error>;
@@ -295,41 +325,22 @@ impl Connection {
     }
 
     fn handleClientData(&mut self, _ctx: &ConnectionContext) -> Result<(), std::io::Error> {
-        let read = self.client_stream.read(self.test_to_remote.get_free_slot())?;
-        self.test_to_remote.produce(read);
-        println!("cli->remote read={}", read);
-
-        let data = self.test_to_remote.get_data();
-        println!("data={}", data.len());
-        let written = self.test_remote_stream.as_ref().unwrap().write(data)?;
-        self.test_to_remote.consume(written);
-        println!("cli->remote wr={}", written);
-
-        Ok(())
-
-        //Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Not implemented"))
+        // FIXME push data in only available direction
+        transerfignRealnosti(self.test_remote_stream.as_mut().unwrap(), &mut self.client_stream, &mut self.test_from_remote)?;
+        transerfignRealnosti(&mut self.client_stream, self.test_remote_stream.as_mut().unwrap(), &mut self.test_to_remote)
     }
 
     fn handleRemoteData(&mut self, _ctx: &ConnectionContext) -> Result<(), std::io::Error> {
-        { // FIXME DONT DO THIS
-            let data = self.test_to_remote.get_data();
-            println!("data={}", data.len());
-            match self.test_remote_stream.as_ref().unwrap().write(data) {
-                Ok(written) => {
-                    self.test_to_remote.consume(written);
-                    println!("cli->remote wr={}", written);
-                },
-                _ => {},
-            };
+        transerfignRealnosti(&mut self.client_stream, self.test_remote_stream.as_mut().unwrap(), &mut self.test_to_remote)?;
+        transerfignRealnosti(self.test_remote_stream.as_mut().unwrap(), &mut self.client_stream, &mut self.test_from_remote)
+    }
+
+    fn deregister(&self, poll: &Poll) -> Result<(), std::io::Error> {
+        println!("deregister");
+        poll.deregister(&self.client_stream)?;
+        if let Some(ref stream) = self.test_remote_stream {
+            poll.deregister(stream)?;
         }
-
-        let read = self.test_remote_stream.as_mut().unwrap().read(self.test_from_remote.get_free_slot())?;
-        self.test_from_remote.produce(read);
-        println!("cli->remote read={}", read);
-
-        let written = self.client_stream.write(self.test_from_remote.get_data())?;
-        self.test_from_remote.consume(written);
-        println!("cli->remote wr={}", written);
 
         Ok(())
     }
@@ -363,15 +374,25 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
                             poll.register(&connections.get_mut(token.0-1).unwrap().client_stream, token,
                                 Ready::readable() | Ready::writable(), PollOpt::edge())?;
                         },
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
                         Err(e) => return Err(Box::new(e))
                     }
                 },
                 Token(t) => {
+                    // FIXME token version vs connection version
                     let index = (t - 1) % MAX_CONNECTIONS;
                     let token = (t - 1) / MAX_CONNECTIONS;
                     println!("Token({}) -> index={}, token={}", t, index, token);
-                    connections.get_mut(index).unwrap().handle(&ConnectionContext::new(index, token, &poll))?;
+                    if let Some(ref mut conn) = connections.get_mut(index) {
+                        //match connections.get_mut(index).unwrap().handle(&ConnectionContext::new(index, token, &poll)) {
+                        match conn.handle(&ConnectionContext::new(index, token, &poll)) {
+                            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                                conn.deregister(&poll)?;
+                                connections.remove(index);
+                            },
+                            _ => {},
+                        };
+                    }
                 }
                 //token => panic!("what! {:?}", token)
             }
