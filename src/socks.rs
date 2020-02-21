@@ -352,7 +352,7 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
     let poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
 
-    let listen_addr = listen.parse()?;
+    let listen_addr = listen.to_socket_addrs()?.next().unwrap();
     let listener = TcpListener::bind(&listen_addr)?;
     poll.register(&listener, LISTENER, Ready::readable(), PollOpt::edge())?;
 
