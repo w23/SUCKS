@@ -11,6 +11,8 @@ chrono = "0.4"
 byteorder = "1.3.2"
 mio = "0.6"
 slab = "0.4"
+log = "0.4"
+env_logger = "0.7"
 
 [profile.release]
 #opt-level = 'z'  # Optimize for size. Binary grows by 200k non stripped, stripped is 4k less. wat; Also segfaults w/ lto+codegen options below

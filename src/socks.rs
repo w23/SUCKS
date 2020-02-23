@@ -11,6 +11,7 @@ use {
         },
     },
     slab::Slab,
+    log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
 
@@ -132,8 +133,6 @@ fn readRequest(stream: &mut TcpStream) -> std::io::Result<Request> {
     let buf = &buf[0..n];
     let mut cursor = Cursor::new(buf);
 
-    println!("{:?}", &buf);
-
     let ver = ReadBytesExt::read_u8(&mut cursor)?;
     if 0x05 != ver {
         return Err(std::io::Error::new(
@@ -162,9 +161,9 @@ impl<'a> ConnectionContext<'a> {
         ConnectionContext { index, token, poll }
     }
 
-    fn register<'b>(&'a self, token: usize, stream: &'b TcpStream) -> Result<(), std::io::Error> {
+    fn register<'b>(&'a self, seq: u32, token: usize, stream: &'b TcpStream) -> Result<(), std::io::Error> {
         self.poll.register(stream,
-            Token(self.index + token * MAX_CONNECTIONS + 1),
+            Token(self.index + token * MAX_CONNECTIONS + (seq << 16) as usize),
             Ready::readable() | Ready::writable(), PollOpt::edge())
     }
 }
@@ -192,6 +191,14 @@ impl RingByteBuffer {
         } else {
             self.buffer.len() - (self.read - self.write) - 1
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.write == self.read
+    }
+
+    fn is_full(&self) -> bool {
+        (self.write + 1) % self.buffer.len() == self.read
     }
 
     fn get_free_slot(&mut self) -> &mut [u8] {
@@ -222,30 +229,75 @@ impl RingByteBuffer {
 }
 
 fn transerfignRealnosti(src: &mut TcpStream, dst: &mut TcpStream, buf: &mut RingByteBuffer) -> Result<(), std::io::Error> {
-    println!("buffer size = {}", buf.queue_size());
-    match src.read(buf.get_free_slot()) {
-        Ok(read) => {
-            buf.produce(read);
-            println!("read={}", read);
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
-        Err(e) => {
-            if buf.queue_size() == 0 {
-                unimplemented!("FIXME: handle {:?}", e);
+    let mut write_blocked = false;
+    let mut read_blocked = false;
+    loop {
+        // First, try to write everything we have
+        while !write_blocked { // TODO can we write everything in one call?
+            let data = buf.get_data();
+            if data.len() == 0 {
+                if read_blocked { return Ok(()); }
+                break;
             }
-        }, // FIXME handle errors
-    };
+            match dst.write(data) {
+                Ok(written) => {
+                    buf.consume(written);
+                    trace!("written={}", written);
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    write_blocked = true;
+                    if read_blocked || buf.is_full() {
+                        return Ok(());
+                    }
+                },
+                Err(e) => {
+                    if buf.queue_size() == 0 {
+                        unimplemented!("FIXME: handle {:?}", e);
+                    }
+                }
+            }
+        }
 
-    let written = dst.write(buf.get_data())?; // FIXME handle wrapping: possible fake starvation
-    buf.consume(written);
-    println!("wr={}", written);
-
-    Ok(())
+        // Then try to read
+        trace!("buffer size = {}", buf.queue_size());
+        while !read_blocked { // TODO can we read everything in one call?
+            let buffer = buf.get_free_slot();
+            if buffer.len() == 0 {
+                if write_blocked { return Ok(()); }
+                break;
+            }
+            match src.read(buffer) {
+                Ok(read) => {
+                    if read == 0 { // FIXME wat
+                        error!("read == 0 ?!");
+                        read_blocked = true;
+                        if write_blocked || buf.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    buf.produce(read);
+                    trace!("read={}", read);
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    read_blocked = true;
+                    if write_blocked || buf.is_empty() {
+                        return Ok(());
+                    }
+                },
+                Err(e) => {
+                    if buf.queue_size() == 0 {
+                        unimplemented!("FIXME: handle {:?}", e);
+                    }
+                },
+            };
+        }
+    }
 }
 
 type ConnectionHandleFn = fn(&mut Connection, &ConnectionContext) -> Result<(), std::io::Error>;
 
 struct Connection {
+    seq: u32,
     client_stream: TcpStream,
     //exit_socket: UdpSocket,
 
@@ -258,8 +310,9 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(stream: TcpStream) -> Connection {
+    fn new(seq: u32, stream: TcpStream) -> Connection {
         Connection {
+            seq,
             client_stream: stream,
             test_remote_stream: None,
             handle_client_stream: Connection::handleClientNewConnection,
@@ -288,7 +341,7 @@ impl Connection {
 
     fn handleClientNewConnection(&mut self, _ctx: &ConnectionContext) -> Result<(), std::io::Error> {
         let connect = readConnect(&mut self.client_stream)?;
-        println!("VER={:02x} METHODS={:?}", connect.ver, connect.methods);
+        info!("C{}: readConnect => VER={:02x} METHODS={:?}", self.seq, connect.ver, connect.methods);
         // FIXME check for 0x05 and method==0
 
         // FIXME check for wouldblock ?
@@ -302,7 +355,7 @@ impl Connection {
 
     fn handleClientRequest(&mut self, ctx: &ConnectionContext) -> Result<(), std::io::Error> {
         let request = readRequest(&mut self.client_stream)?;
-        println!("Request: {:?}", request);
+        info!("C{}: readRequest => {:?}", self.seq, request);
 
         match request.cmd {
             Command::Connect => {},
@@ -312,7 +365,7 @@ impl Connection {
         let remote_addr = request.socket_addr();
         self.test_remote_stream = Some(TcpStream::connect(&remote_addr)?);
         self.test_handle_remote_stream = Some(Connection::handleRemoteData);
-        ctx.register(1, self.test_remote_stream.as_ref().unwrap())?;
+        ctx.register(self.seq, 1, self.test_remote_stream.as_ref().unwrap())?;
 
         // Reply to client
         // FIXME WouldBlock
@@ -336,7 +389,7 @@ impl Connection {
     }
 
     fn deregister(&self, poll: &Poll) -> Result<(), std::io::Error> {
-        println!("deregister");
+        trace!("C{}: deregister", self.seq);
         poll.deregister(&self.client_stream)?;
         if let Some(ref stream) = self.test_remote_stream {
             poll.deregister(stream)?;
@@ -346,7 +399,7 @@ impl Connection {
     }
 }
 
-const LISTENER: Token = Token(0);
+const LISTENER: Token = Token(65535);
 
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
     let poll = Poll::new()?;
@@ -358,20 +411,24 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
 
     let mut connections = Slab::<Connection>::with_capacity(MAX_CONNECTIONS);
 
+    let mut conn_seq: u32 = 0;
+
     loop {
-        println!("loop");
+        trace!("loop");
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
-            println!("event: {:?}", event);
+            debug!("event: {:?}", event);
             match event.token() {
                 LISTENER => {
                     match listener.accept() {
                         Ok((socket, _)) => {
-                            println!("New socket: {:?}", socket);
-                            let token = Token(connections.insert(Connection::new(socket)) + 1);
-                            println!("Token {}", token.0);
-                            poll.register(&connections.get_mut(token.0-1).unwrap().client_stream, token,
+                            conn_seq += 1;
+                            let index = connections.insert(Connection::new(conn_seq, socket));
+                            let token = Token(index + (conn_seq << 16) as usize);
+                            let conn = connections.get_mut(index).unwrap();
+                            info!("C{}: token {} for socket {:?}", conn.seq, token.0, conn.client_stream);
+                            poll.register(&conn.client_stream, token,
                                 Ready::readable() | Ready::writable(), PollOpt::edge())?;
                         },
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
@@ -380,18 +437,23 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
                 },
                 Token(t) => {
                     // FIXME token version vs connection version
-                    let index = (t - 1) % MAX_CONNECTIONS;
-                    let token = (t - 1) / MAX_CONNECTIONS;
-                    println!("Token({}) -> index={}, token={}", t, index, token);
+                    let seq = (t >> 16) as u32;
+                    let index = (t & 0xffff) % MAX_CONNECTIONS;
+                    let token = (t & 0xffff) / MAX_CONNECTIONS;
+                    trace!("Token({}) -> seq={}, index={}, token={}", t, seq, index, token);
                     if let Some(ref mut conn) = connections.get_mut(index) {
-                        //match connections.get_mut(index).unwrap().handle(&ConnectionContext::new(index, token, &poll)) {
-                        match conn.handle(&ConnectionContext::new(index, token, &poll)) {
-                            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
-                                conn.deregister(&poll)?;
-                                connections.remove(index);
-                            },
-                            _ => {},
-                        };
+                        if conn.seq != seq {
+                            warn!("Mismatched sequence for C{}: expected {}", seq, conn.seq);
+                        } else {
+                            //match connections.get_mut(index).unwrap().handle(&ConnectionContext::new(index, token, &poll)) {
+                            match conn.handle(&ConnectionContext::new(index, token, &poll)) {
+                                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                                    conn.deregister(&poll)?;
+                                    connections.remove(index);
+                                },
+                                _ => {},
+                            };
+                        }
                     }
                 }
                 //token => panic!("what! {:?}", token)
