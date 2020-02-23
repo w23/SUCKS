@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 use std::env;
+use env_logger;
 
 mod socks;
 mod exit;
@@ -27,6 +28,8 @@ impl std::error::Error for SimpleError {}
 */
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
     let args: Vec<String> = env::args().collect();
     socks::main(&args[1], "")
 }
