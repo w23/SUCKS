@@ -262,21 +262,30 @@ fn transerfignRealnosti(src: &mut TcpStream, dst: &mut TcpStream, buf: &mut Ring
         trace!("buffer size = {}", buf.queue_size());
         while !read_blocked { // TODO can we read everything in one call?
             let buffer = buf.get_free_slot();
+            let buffer_size = buffer.len();
             if buffer.len() == 0 {
                 if write_blocked { return Ok(()); }
                 break;
             }
             match src.read(buffer) {
                 Ok(read) => {
-                    if read == 0 { // FIXME wat
-                        error!("read == 0 ?!");
+                    if read == 0 {
+                        // Means that socket should be closed
+                        // FIXME handle sending remaining data
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Socket closed"));
+                    }
+
+                    buf.produce(read);
+                    trace!("read={}", read);
+
+                    // Do not make second attempt of reading if first one haven't written the
+                    // entire buffer
+                    if read != buffer_size {
                         read_blocked = true;
                         if write_blocked || buf.is_empty() {
                             return Ok(());
                         }
                     }
-                    buf.produce(read);
-                    trace!("read={}", read);
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     read_blocked = true;
@@ -322,7 +331,13 @@ impl Connection {
         }
     }
 
-    fn handle(&mut self, ctx: &ConnectionContext) -> Result<(), std::io::Error> {
+    fn handle(&mut self, ctx: &ConnectionContext, readiness: mio::Ready) -> Result<(), std::io::Error> {
+
+        // FIXME don't do this
+        if readiness.is_error() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "socket error"));
+        }
+
         let handle: Option<ConnectionHandleFn> =
             if ctx.token == 0 {
                 Some(self.handle_client_stream)
@@ -414,7 +429,7 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
     let mut conn_seq: u32 = 0;
 
     loop {
-        trace!("loop");
+        trace!("loop. connections={}", connections.len());
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
@@ -446,7 +461,7 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
                             warn!("Mismatched sequence for C{}: expected {}", seq, conn.seq);
                         } else {
                             //match connections.get_mut(index).unwrap().handle(&ConnectionContext::new(index, token, &poll)) {
-                            match conn.handle(&ConnectionContext::new(index, token, &poll)) {
+                            match conn.handle(&ConnectionContext::new(index, token, &poll), event.readiness()) {
                                 Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
                                     conn.deregister(&poll)?;
                                     connections.remove(index);
