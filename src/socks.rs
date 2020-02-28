@@ -436,18 +436,20 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
             debug!("event: {:?}", event);
             match event.token() {
                 LISTENER => {
-                    match listener.accept() {
-                        Ok((socket, _)) => {
-                            conn_seq += 1;
-                            let index = connections.insert(Connection::new(conn_seq, socket));
-                            let token = Token(index + (conn_seq << 16) as usize);
-                            let conn = connections.get_mut(index).unwrap();
-                            info!("C{}: token {} for socket {:?}", conn.seq, token.0, conn.client_stream);
-                            poll.register(&conn.client_stream, token,
-                                Ready::readable() | Ready::writable(), PollOpt::edge())?;
-                        },
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
-                        Err(e) => return Err(Box::new(e))
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                conn_seq += 1;
+                                let index = connections.insert(Connection::new(conn_seq, socket));
+                                let token = Token(index + (conn_seq << 16) as usize);
+                                let conn = connections.get_mut(index).unwrap();
+                                info!("C{}: token {} for socket {:?}", conn.seq, token.0, conn.client_stream);
+                                poll.register(&conn.client_stream, token,
+                                    Ready::readable() | Ready::writable(), PollOpt::edge())?;
+                            },
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                            Err(e) => return Err(Box::new(e))
+                        }
                     }
                 },
                 Token(t) => {
