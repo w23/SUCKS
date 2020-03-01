@@ -4,6 +4,7 @@ use env_logger;
 
 mod socks;
 mod exit;
+mod ste;
 
 /*
 #[derive(Debug)]
