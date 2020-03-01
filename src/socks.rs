@@ -15,6 +15,8 @@ use {
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
 
+use crate::ste;
+
 struct Connect {
     ver: u8,
     methods: Vec<u8>
@@ -417,6 +419,18 @@ impl Connection {
 const LISTENER: Token = Token(65535);
 
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
+
+    // kek
+    {
+        let mut ste = ste::Ste::new().unwrap();
+        let listener = ste::Listen::new(listen, Box::new(|| {
+            info!("lol");
+            Ok(())
+        }))?;
+        ste.listen(listener)?;
+        ste.run()?;
+    }
+
     let poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
 
