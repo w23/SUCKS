@@ -32,5 +32,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args: Vec<String> = env::args().collect();
-    socks::main(&args[1], "")
+    socks::main(&args[1], args.get(2).unwrap_or(&String::from("")))
 }

@@ -1,5 +1,8 @@
 use {
     std::{
+        //borrow::{BorrowMut},
+        cell::{RefCell},
+        rc::Rc,
         io::{Write, Read, Cursor, Seek},
         net::{IpAddr, ToSocketAddrs},
     },
@@ -11,15 +14,16 @@ use {
         },
     },
     log::{info, trace, warn, error, debug},
+    ochenslab::OchenSlab,
 };
 
-trait StreamHandler {
+pub trait StreamHandler {
     fn push(&mut self);
     fn pull(&mut self);
 }
 
-//type ListenCallback = dyn Fn() -> Result<Box<dyn StreamHandler>, std::io::Error>;
-type ListenCallback = dyn Fn() -> Result<(), std::io::Error>;
+type ListenCallback = dyn Fn() -> Result<Box<dyn StreamHandler>, std::io::Error>;
+//type ListenCallback = dyn Fn() -> Result<(), std::io::Error>;
 
 pub struct Listen
 {
@@ -46,6 +50,22 @@ impl Stream {
     fn new(stream_socket: TcpStream, stream_handler: Box<dyn StreamHandler>) -> Stream {
         Stream { stream_socket, stream_handler }
     }
+
+    fn handle(&mut self, ready: mio::Ready) -> Result<(), Box<dyn std::error::Error>> {
+        if ready.is_error() {
+            unimplemented!("readiness error not implemented");
+        }
+        if ready.is_hup() {
+            unimplemented!("readiness hup not implemented");
+        }
+        if ready.is_readable() {
+            self.stream_handler.push();
+        }
+        if ready.is_writable() {
+            self.stream_handler.pull();
+        }
+        Ok(())
+    }
 }
 
 enum SocketData {
@@ -71,70 +91,23 @@ impl Socket {
             data: SocketData::Stream(stream),
         }
     }
-}
 
-struct OchenSlab<T> {
-    storage: Vec<Option<T>>,
-    free: Vec<usize>,
-}
-
-impl<T> OchenSlab<T> {
-    fn with_capacity(capacity: usize) -> OchenSlab<T> {
-        let mut storage = Vec::<Option<T>>::with_capacity(capacity);
-        storage.resize_with(capacity, || None);
-        let mut free = Vec::<usize>::with_capacity(capacity);
-        let mut i = 0 as usize;
-        free.resize_with(capacity, || {
-            let value = capacity - 1 - i;
-            i += 1;
-            value
-        });
-
-        OchenSlab {
-            storage, free
+    fn getMioSocket(&mut self) -> &mut dyn mio::event::Evented {
+       match &mut self.data {
+            SocketData::Listener(listen) => &mut listen.listener,
+            SocketData::Stream(stream) => &mut stream.stream_socket,
         }
     }
 
-    fn len(&self) -> usize {
-        self.storage.len() - self.free.len()
-    }
-
-    fn get(&self, index: usize) -> Option<&T> {
-        if index >= self.storage.len() { return None; }
-
-        self.storage[index].as_ref()
-    }
-
-    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        if index >= self.storage.len() { return None; }
-
-        self.storage[index].as_mut()
-    }
-
-    fn insert(&mut self, t: T) -> Option<usize> {
-        let index = self.free.pop();
-        if index.is_none() { return None; }
-        let index = index.unwrap();
-
-        self.storage[index] = Some(t);
-        Some(index)
-    }
-
-    fn remove(&mut self, index: usize) -> Option<T> {
-        if index >= self.storage.len() { return None; }
-
-        let value = self.storage[index].take();
-        if value.is_some() {
-            self.free.push(index);
-        }
-
-        value
+    fn dummy(&mut self) {
     }
 }
+
+type SocketsContainer = OchenSlab::<Rc<RefCell<Socket>>>;
 
 pub struct Ste {
     poll: Poll,
-    sockets: OchenSlab::<Socket>,
+    sockets: SocketsContainer,
     seq: usize,
 }
 
@@ -144,7 +117,7 @@ impl Ste {
     pub fn new() -> Result<Ste, Box<dyn std::error::Error>> {
         Ok(Ste {
             poll: Poll::new()?,
-            sockets: OchenSlab::<Socket>::with_capacity(MAX_SOCKETS),
+            sockets: SocketsContainer::with_capacity(MAX_SOCKETS),
             seq: 0,
         })
     }
@@ -156,51 +129,67 @@ impl Ste {
 
     pub fn listen(&mut self, listener: Listen) -> Result<(), std::io::Error> {
         let seq = self.get_seq();
-        let index = self.sockets.insert(Socket::from_listen(seq, listener));
-        if index.is_none() { return Err(std::io::Error::new(std::io::ErrorKind::Other, "Capacity exceeded")); }
-        let index = index.unwrap();
-        let sock = self.sockets.get_mut(index).unwrap();
+        let socket = Rc::new(RefCell::new(Socket::from_listen(seq, listener)));
+        let index = match self.sockets.insert(Rc::clone(&socket)) {
+            None => { return Err(std::io::Error::new(std::io::ErrorKind::Other, "Capacity exceeded")); },
+            Some(index) => index
+        };
+
         let token = Token(index + (self.seq << 16));
-        if let SocketData::Listener(listen) = &sock.data {
-            info!("C{}: token {} for socket {:?}", sock.seq, token.0, listen.listener);
-            self.poll.register(&listen.listener, token,
-                Ready::readable() | Ready::writable(), PollOpt::edge())
-        } else {
-            panic!("Stored Listener value, restored non-Listener");
-        }
+
+        let mut socket = socket.borrow_mut();
+        let listen = socket.getMioSocket();
+        info!("S{}: token {} for listened socket", seq, token.0);
+        self.poll.register(listen, token,
+            Ready::readable() | Ready::writable(), PollOpt::edge())
     }
 
-    fn handleSocketIndex(&mut self, index: usize, seq: usize) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO how to nest less
-        if let Some(ref mut sock) = self.sockets.get(index) {
-            match &sock.data {
-                SocketData::Listener(listen) => loop {
-                    match listen.listener.accept() {
-                        Ok((socket, _)) => {
-                            let stream_handler = (listen.callback)()?;
-                            error!("New socket {:?} not implemented", socket);
-                            //let seq = self.get_seq();
-                            //let mut stream = Stream::new(socket, stream_handler);
-                            //let socket_obj = Socket::from_stream(seq, stream);
-                            /*
-                            conn_seq += 1;
-                            let index = connections.insert(Connection::new(conn_seq, socket));
-                            let token = Token(index + (conn_seq << 16) as usize);
-                            let conn = connections.get_mut(index).unwrap();
-                            info!("C{}: token {} for socket {:?}", conn.seq, token.0, conn.client_stream);
-                            poll.register(&conn.client_stream, token,
-                                Ready::readable() | Ready::writable(), PollOpt::edge())?;
-                            */
-                        },
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
-                        Err(e) => return Err(Box::new(e))
-                    }
-                },
-                SocketData::Stream(stream) => loop {
-                },
+    fn handleSocketIndex(&mut self, index: usize, seq: usize, ready: mio::Ready) -> Result<(), Box<dyn std::error::Error>> {
+        let sock = match self.sockets.get(index) {
+            Some(sock) => sock,
+            None => {
+                warn!("Stale event for S{}", seq);
+                return Ok(());
             }
-        } else {
-            warn!("Stale event for C{}", seq);
+        }.clone();
+        let mut sock = sock.borrow_mut();
+
+        if sock.seq != seq {
+            warn!("S{} Stale seq {} received, slot has {}", index, seq, sock.seq);
+            return Ok(());
+        }
+
+        // TODO how to nest less
+        match &mut sock.data {
+            SocketData::Listener(listen) => loop {
+                match listen.listener.accept() {
+                    Ok((socket, _)) => {
+                        info!("New connect: {:?}", socket);
+
+                        let seq = self.get_seq();
+                        let stream = Stream::new(socket, (listen.callback)()?);
+                        let socket = Rc::new(RefCell::new(Socket::from_stream(seq, stream)));
+
+                        let token = Token(match self.sockets.insert(Rc::clone(&socket)) {
+                            None => {
+                                //error!("Cannot insert {:?}, no slots available", socket);
+                                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "sockets slots exhausted")));
+                            },
+                            Some(index) => index
+                        } | (seq << 16));
+
+                        info!("S{}: token {}", self.seq, token.0);
+                        self.poll.register(socket.borrow_mut().getMioSocket(), token,
+                            Ready::readable() | Ready::writable(), PollOpt::edge())?;
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                    Err(e) => return Err(Box::new(e))
+                }
+            },
+            SocketData::Stream(ref mut stream) => {
+                debug!("S{} event {:?}", index, ready);
+                return stream.handle(ready);
+            },
         }
 
         Ok(())
@@ -219,7 +208,7 @@ impl Ste {
                 let seq = t >> 16;
                 let index = (t & 0xffff) % MAX_SOCKETS;
 
-                self.handleSocketIndex(index, seq)?
+                self.handleSocketIndex(index, seq, event.readiness())?
             }
         }
     }

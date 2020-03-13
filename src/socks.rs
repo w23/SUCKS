@@ -10,7 +10,7 @@ use {
             TcpStream, TcpListener,
         },
     },
-    slab::Slab,
+    ochenslab::OchenSlab,
     log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
@@ -418,14 +418,27 @@ impl Connection {
 
 const LISTENER: Token = Token(65535);
 
-pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug)]
+struct Connection1 {
+}
 
-    // kek
+impl ste::StreamHandler for Connection1 {
+    fn push(&mut self) {
+        debug!("{:?} push", self);
+    }
+
+    fn pull(&mut self) {
+        debug!("{:?} pull", self);
+    }
+}
+
+pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if exit == "ste"
     {
         let mut ste = ste::Ste::new().unwrap();
         let listener = ste::Listen::new(listen, Box::new(|| {
             info!("lol");
-            Ok(())
+            Ok(Box::new(Connection1{}))
         }))?;
         ste.listen(listener)?;
         ste.run()?;
@@ -438,7 +451,7 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
     let listener = TcpListener::bind(&listen_addr)?;
     poll.register(&listener, LISTENER, Ready::readable(), PollOpt::edge())?;
 
-    let mut connections = Slab::<Connection>::with_capacity(MAX_CONNECTIONS);
+    let mut connections = OchenSlab::<Connection>::with_capacity(MAX_CONNECTIONS);
 
     let mut conn_seq: u32 = 0;
 
@@ -455,6 +468,11 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
                             Ok((socket, _)) => {
                                 conn_seq += 1;
                                 let index = connections.insert(Connection::new(conn_seq, socket));
+                                if index.is_none() {
+                                    error!("Too many connections: {}", connections.len());
+                                    break;
+                                }
+                                let index = index.expect("Too many connections");
                                 let token = Token(index + (conn_seq << 16) as usize);
                                 let conn = connections.get_mut(index).unwrap();
                                 info!("C{}: token {} for socket {:?}", conn.seq, token.0, conn.client_stream);
