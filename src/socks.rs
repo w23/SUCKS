@@ -435,8 +435,8 @@ impl ste::StreamHandler for Connection1 {
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
     if exit == "ste"
     {
-        let mut ste = ste::Ste::new().unwrap();
-        let listener = ste::Listen::new(listen, Box::new(|| {
+        let mut ste = ste::Ste::new(128).unwrap();
+        let listener = ste::SocketListener::new(listen, Box::new(|| {
             info!("lol");
             Ok(Box::new(Connection1{}))
         }))?;
