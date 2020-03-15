@@ -418,17 +418,31 @@ impl Connection {
 
 const LISTENER: Token = Token(65535);
 
-#[derive(Debug)]
 struct Connection1 {
+    from_client: RingByteBuffer,
+    to_client: RingByteBuffer,
+}
+
+impl Connection1 {
+    fn new() -> Connection1 {
+        Connection1 {
+            from_client: RingByteBuffer::new(),
+            to_client: RingByteBuffer::new(),
+        }
+    }
 }
 
 impl ste::StreamHandler for Connection1 {
-    fn push(&mut self) {
-        debug!("{:?} push", self);
+    fn push(&mut self, received: usize) -> &mut [u8] {
+        debug!("push {}", received);
+        self.from_client.produce(received);
+        self.from_client.get_free_slot()
     }
 
-    fn pull(&mut self) {
-        debug!("{:?} pull", self);
+    fn pull(&mut self, sent: usize) -> &[u8] {
+        debug!("pull {}", sent);
+        self.to_client.consume(sent);
+        self.to_client.get_data()
     }
 }
 
@@ -438,7 +452,7 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
         let mut ste = ste::Ste::new(128).unwrap();
         let listener = ste::SocketListener::new(listen, Box::new(|| {
             info!("lol");
-            Ok(Box::new(Connection1{}))
+            Ok(Box::new(Connection1::new()))
         }))?;
         ste.listen(listener)?;
         ste.run()?;
