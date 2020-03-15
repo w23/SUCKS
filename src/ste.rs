@@ -141,59 +141,40 @@ impl Ste {
             Ready::readable() | Ready::writable(), PollOpt::edge())
     }
 
-    fn handleSocketIndex(&mut self, index: usize, seq: usize, ready: mio::Ready) -> Result<(), Box<dyn std::error::Error>> {
-        let sock = match self.sockets.get(index) {
-            Some(sock) => sock,
-            None => {
-                warn!("Stale event for S{}", seq);
-                return Ok(());
+    fn handleListen(&mut self, ready: mio::Ready, sock: &mut SocketListener) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            match sock.listener.accept() {
+                Ok((socket, _)) => {
+                    info!("New connect: {:?}", socket);
+
+                    let seq = self.get_seq();
+                    let stream = SocketTcp::new(socket, (sock.callback)()?);
+                    let socket = Rc::new(RefCell::new(SocketKind::Tcp(stream)));
+
+                    let token = Token(match self.sockets.insert(VersionedSocket::new(seq, socket.clone())) {
+                        None => {
+                            //error!("Cannot insert {:?}, no slots available", socket);
+                            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "sockets slots exhausted")));
+                        },
+                        Some(index) => index
+                    } | (seq << 16));
+
+                    info!("S{}: token {}", self.seq, token.0);
+                    self.poll.register(socket.borrow_mut().get_mio_evented(), token,
+                        Ready::readable() | Ready::writable(), PollOpt::edge())?;
+
+                    // FIXME if register failed we should let user know that socket failed
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                Err(e) => return Err(Box::new(e))
             }
-        };
-
-        let sock = match sock.get(seq) {
-            Some(sock) => sock,
-            None => {
-                warn!("S{} Stale seq {} received, slot has {}", index, seq, sock.seq);
-                return Ok(());
-            }
-        }.clone();
-
-        let mut sock = sock.borrow_mut();
-
-        // TODO how to nest less
-        match sock.deref_mut() {
-            SocketKind::Listener(listen) => loop {
-                match listen.listener.accept() {
-                    Ok((socket, _)) => {
-                        info!("New connect: {:?}", socket);
-
-                        let seq = self.get_seq();
-                        let stream = SocketTcp::new(socket, (listen.callback)()?);
-                        let socket = Rc::new(RefCell::new(SocketKind::Tcp(stream)));
-
-                        let token = Token(match self.sockets.insert(VersionedSocket::new(seq, socket.clone())) {
-                            None => {
-                                //error!("Cannot insert {:?}, no slots available", socket);
-                                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "sockets slots exhausted")));
-                            },
-                            Some(index) => index
-                        } | (seq << 16));
-
-                        info!("S{}: token {}", self.seq, token.0);
-                        self.poll.register(socket.borrow_mut().get_mio_evented(), token,
-                            Ready::readable() | Ready::writable(), PollOpt::edge())?;
-                    },
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
-                    Err(e) => return Err(Box::new(e))
-                }
-            },
-            SocketKind::Tcp(ref mut stream) => {
-                debug!("S{} event {:?}", index, ready);
-                return stream.handle(ready);
-            },
         }
 
         Ok(())
+    }
+
+    fn handleTcp(&mut self, ready: mio::Ready, sock: &mut SocketTcp) -> Result<(), Box<dyn std::error::Error>> {
+        return sock.handle(ready);
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -204,12 +185,39 @@ impl Ste {
             self.poll.poll(&mut events, None).unwrap();
 
             for event in &events {
-                debug!("event: {:?}", event);
                 let t = event.token().0;
                 let seq = t >> 16;
                 let index = (t & 0xffff) % self.sockets.capacity();
 
-                self.handleSocketIndex(index, seq, event.readiness())?
+                debug!("event: {:?}", event);
+
+                let sock = match self.sockets.get(index) {
+                    Some(sock) => sock,
+                    None => {
+                        warn!("S{}: stale event, no such socket", index);
+                        return Ok(());
+                    }
+                };
+
+                let sock = match sock.get(seq) {
+                    Some(sock) => sock,
+                    None => {
+                        warn!("S{} stale seq {} received, slot has {}", index, seq, sock.seq);
+                        return Ok(());
+                    }
+                }.clone();
+
+                let mut sock = sock.borrow_mut();
+
+                let result = match sock.deref_mut() {
+                    SocketKind::Listener(listen) => self.handleListen(event.readiness(), listen),
+                    SocketKind::Tcp(stream) => self.handleTcp(event.readiness(), stream),
+                };
+
+                match result {
+                    Ok(_) => {},
+                    Err(err) => error!("S{}: error {:?}", index, err),
+                };
             }
         }
     }
