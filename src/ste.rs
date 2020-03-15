@@ -19,8 +19,8 @@ use {
 };
 
 pub trait StreamHandler {
-    fn push(&mut self);
-    fn pull(&mut self);
+    fn push(&mut self, received: usize) -> &mut [u8];
+    fn pull(&mut self, sent: usize) -> &[u8];
 }
 
 type ListenCallback = dyn Fn() -> Result<Box<dyn StreamHandler>, std::io::Error>;
@@ -53,6 +53,11 @@ impl SocketTcp {
     }
 
     fn handle(&mut self, ready: mio::Ready) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. have data to send
+        // 2. have buffer space to receive
+        // 3. ready: can send
+        // 4. ready: can recv
+
         if ready.is_error() {
             unimplemented!("readiness error not implemented");
         }
@@ -60,10 +65,18 @@ impl SocketTcp {
             unimplemented!("readiness hup not implemented");
         }
         if ready.is_readable() {
-            self.stream_handler.push();
+            let mut buf = self.stream_handler.push(0);
+            loop {
+                if buf.len() == 0 { break; }
+                let read = self.stream_socket.read(buf)?;
+                if read != 0 {
+                    buf = self.stream_handler.push(read);
+                }
+                if read < buf.len() { break; }
+            }
         }
         if ready.is_writable() {
-            self.stream_handler.pull();
+            let buf = self.stream_handler.pull(0);
         }
         Ok(())
     }
