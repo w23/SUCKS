@@ -18,13 +18,37 @@ use {
     ochenslab::OchenSlab,
 };
 
+pub struct StreamSocket {
+    socket: SocketRc
+}
+
+impl StreamSocket {
+    fn new(socket: SocketRc) -> StreamSocket {
+        StreamSocket { socket }
+    }
+
+    pub fn close(&mut self) {
+        unimplemented!("");
+    }
+}
+
+impl std::io::Write for StreamSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        unimplemented!("");
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        unimplemented!("");
+    }
+}
+
 pub trait StreamHandler {
-    fn push(&mut self, received: usize) -> &mut [u8];
-    fn pull(&mut self, sent: usize) -> &[u8];
+    fn created(&mut self, socket: StreamSocket);
+    fn push(&mut self, received: usize) -> Option<&mut [u8]>;
+    fn pull(&mut self, sent: usize) -> Option<&[u8]>;
 }
 
 type ListenCallback = dyn Fn() -> Result<Box<dyn StreamHandler>, std::io::Error>;
-//type ListenCallback = dyn Fn() -> Result<(), std::io::Error>;
 
 pub struct SocketListener
 {
@@ -65,18 +89,71 @@ impl SocketTcp {
             unimplemented!("readiness hup not implemented");
         }
         if ready.is_readable() {
-            let mut buf = self.stream_handler.push(0);
-            loop {
-                if buf.len() == 0 { break; }
-                let read = self.stream_socket.read(buf)?;
-                if read != 0 {
-                    buf = self.stream_handler.push(read);
+            // Allocate buffer for dumping data from socket to
+            match self.stream_handler.push(0) {
+                // Client doesn't want to accept any more data
+                None => {
+                    // TODO Don't try read from socket anymore
+                },
+                Some(buf) => {
+                    // Write as much data as possible (client may accept it in small chunks)
+                    let mut buf = buf;
+                    loop {
+                        // Stop reading from socket if there's no space
+                        if buf.len() == 0 { break; }
+
+                        // Read data into provided buffer
+                        let read = self.stream_socket.read(buf)?;
+
+                        // Push data to client if read succeeded (client will provide next buffer
+                        // to accept data to)
+                        if read != 0 {
+                            buf = match self.stream_handler.push(read) {
+                                None => { break; }, // TODO Mark client as not accepting data anymore
+                                Some(buf) => buf
+                            };
+                        }
+
+                        // If data read from socket was smaller than buffer size,
+                        // then it means that socket is drained and cannot be read
+                        // until next portion of data arrives from remote host
+                        if read < buf.len() { break; }
+                    }
                 }
-                if read < buf.len() { break; }
-            }
+            };
         }
         if ready.is_writable() {
-            let buf = self.stream_handler.pull(0);
+            // Get buffer of data to send through socket
+            match self.stream_handler.pull(0) {
+                // Client will not sent data through this socket anymore
+                None => {
+                    // TODO mark this socket as not writable anymore
+                },
+                Some(buf) => {
+                    // Write as much data as possible (client may produce it in small chunks)
+                    let mut buf = buf;
+                    loop {
+                        // Stop sending to socket if there's nothing to send lol
+                        if buf.len() == 0 { break; }
+
+                        // Write data to socket
+                        let written = self.stream_socket.write(buf)?;
+
+                        // Let client know how much data was send (client will provide next chunk)
+                        if written != 0 {
+                            buf = match self.stream_handler.pull(written) {
+                                None => { break; }, // TODO Mark client as not accepting data anymore
+                                Some(buf) => buf
+                            };
+                        }
+
+                        // If data written to socket was smaller than data to send,
+                        // then it means that socket is full and won't accept any
+                        // more data now
+                        if written < buf.len() { break; }
+                    }
+                }
+            };
         }
         Ok(())
     }
@@ -94,11 +171,23 @@ impl SocketKind {
             SocketKind::Tcp(stream) => &mut stream.stream_socket,
         }
     }
+
+    fn created(&mut self, socket: StreamSocket) {
+        match self {
+            SocketKind::Tcp(ref mut stream) => {
+                let handler = &mut stream.stream_handler;
+                handler.created(socket)
+            }
+            SocketKind::Listener(_) => {},
+        }
+    }
 }
+
+type SocketRc = Rc<RefCell<SocketKind>>;
 
 struct VersionedSocket {
     seq: usize,
-    socket: Rc<RefCell<SocketKind>>
+    socket: SocketRc
 }
 
 impl VersionedSocket {
@@ -162,21 +251,25 @@ impl Ste {
 
                     let seq = self.get_seq();
                     let stream = SocketTcp::new(socket, (sock.callback)()?);
-                    let socket = Rc::new(RefCell::new(SocketKind::Tcp(stream)));
+                    let socket_rc = Rc::new(RefCell::new(SocketKind::Tcp(stream)));
 
-                    let token = Token(match self.sockets.insert(VersionedSocket::new(seq, socket.clone())) {
+                    let token = Token(match self.sockets.insert(VersionedSocket::new(seq, socket_rc.clone())) {
                         None => {
+                            // FIXME tell user that we've failed
                             //error!("Cannot insert {:?}, no slots available", socket);
                             return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "sockets slots exhausted")));
                         },
                         Some(index) => index
                     } | (seq << 16));
 
+                    let mut socket = socket_rc.borrow_mut();
+
                     info!("S{}: token {}", self.seq, token.0);
-                    self.poll.register(socket.borrow_mut().get_mio_evented(), token,
+                    // FIXME if register failed we should let user know that socket failed
+                    self.poll.register(socket.get_mio_evented(), token,
                         Ready::readable() | Ready::writable(), PollOpt::edge())?;
 
-                    // FIXME if register failed we should let user know that socket failed
+                    socket.created(StreamSocket::new(socket_rc.clone()));
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
                 Err(e) => return Err(Box::new(e))
