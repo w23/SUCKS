@@ -42,22 +42,23 @@ impl std::io::Write for StreamSocket {
     }
 }
 
-pub trait StreamHandler {
-    fn created(&mut self, socket: StreamSocket);
-    fn push(&mut self, received: usize) -> Option<&mut [u8]>;
-    fn pull(&mut self, sent: usize) -> Option<&[u8]>;
+pub struct StreamHandler {
+    created: dyn Fn(StreamSocket),
+    push: dyn Fn(&[u8]) -> Option<usize>, // None -- stop pushing
+    pull: dyn Fn(&mut [u8]) -> Option<usize>, // --//-- pulling
+    error: dyn Fn(std::io::Error),
 }
 
-type ListenCallback = dyn Fn() -> Result<Box<dyn StreamHandler>, std::io::Error>;
+type ListenCallback = dyn Fn() -> Result<StreamHandler, std::io::Error>;
 
-pub struct SocketListener
+struct SocketListener
 {
     listener: mio::net::TcpListener,
     callback: Box<ListenCallback>,
 }
 
 impl SocketListener {
-    pub fn new(bind_addr: &str, callback: Box<ListenCallback>) -> Result<SocketListener, Box<dyn std::error::Error>> {
+    fn new(bind_addr: &str, callback: Box<ListenCallback>) -> Result<SocketListener, Box<dyn std::error::Error>> {
         let listen_addr = bind_addr.to_socket_addrs()?.next().unwrap();
         Ok(SocketListener {
             listener: mio::net::TcpListener::bind(&listen_addr)?,
@@ -68,11 +69,11 @@ impl SocketListener {
 
 struct SocketTcp {
     stream_socket: TcpStream,
-    stream_handler: Box<dyn StreamHandler>
+    stream_handler: StreamHandler,
 }
 
 impl SocketTcp {
-    fn new(stream_socket: TcpStream, stream_handler: Box<dyn StreamHandler>) -> SocketTcp {
+    fn new(stream_socket: TcpStream, stream_handler: StreamHandler) -> SocketTcp {
         SocketTcp { stream_socket, stream_handler }
     }
 
@@ -226,7 +227,9 @@ impl Ste {
         self.seq
     }
 
-    pub fn listen(&mut self, listener: SocketListener) -> Result<(), std::io::Error> {
+    // FIXME return closable/droppable object
+    pub fn listen(&mut self, bind_addr: &str, callback: Box<ListenCallback>) -> Result<(), std::io::Error> {
+        let listener = SocketListener::new(bind_addr, callback)?;
         let seq = self.get_seq();
         let socket = Rc::new(RefCell::new(SocketKind::Listener(listener)));
         let index = match self.sockets.insert(VersionedSocket::new(seq, socket.clone())) {
@@ -242,6 +245,8 @@ impl Ste {
         self.poll.register(listen, token,
             Ready::readable() | Ready::writable(), PollOpt::edge())
     }
+
+    //pub fn connectTcp(&mut self, sock_addr: std::net::SocketAddr) -> Result<
 
     fn handleListen(&mut self, ready: mio::Ready, sock: &mut SocketListener) -> Result<(), Box<dyn std::error::Error>> {
         loop {

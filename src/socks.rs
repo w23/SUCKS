@@ -291,9 +291,14 @@ impl Connection1 {
             state: Connection1State::Handshake,
         }
     }
-}
 
-impl ste::StreamHandler for Connection1 {
+    fn client_handler() -> ste::StreamHandler {
+        ste::StreamHandler {
+            created: || {
+            },
+        }
+    }
+
     fn created(&mut self, socket: ste::StreamSocket) {
         self.client_socket = Some(socket);
     }
@@ -367,10 +372,10 @@ impl ste::StreamHandler for Connection1 {
 
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ste = ste::Ste::new(128).unwrap();
-    let listener = ste::SocketListener::new(listen, Box::new(|| {
+    
+    ste.listen(listen, Box::new(|| {
         info!("lol");
-        Ok(Box::new(Connection1::new()))
+        Ok(Connection1::new().client_handler())
     }))?;
-    ste.listen(listener)?;
     ste.run()
 }
