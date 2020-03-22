@@ -1,7 +1,9 @@
 use {
     std::{
+        cell::{RefCell},
         io::{Write, Read, Cursor, Seek},
         net::{IpAddr, ToSocketAddrs},
+        rc::Rc,
     },
     mio::{
         Events, Poll, PollOpt, Ready, Token,
@@ -131,93 +133,6 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
     return Ok(Request{cmd, addr, port});
 }
 
-const TEST_BUFFER_SIZE: usize = 8192;
-
-struct RingByteBuffer {
-    buffer: [u8; TEST_BUFFER_SIZE],
-    write: usize,
-    read: usize,
-}
-
-impl RingByteBuffer {
-    fn new() -> RingByteBuffer {
-        RingByteBuffer {
-            buffer: [0; TEST_BUFFER_SIZE],
-            write: 0,
-            read: 0,
-        }
-    }
-
-    fn queue_size(&self) -> usize {
-        if self.write >= self.read {
-            self.write - self.read
-        } else {
-            self.buffer.len() - (self.read - self.write) - 1
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.write == self.read
-    }
-
-    fn is_full(&self) -> bool {
-        (self.write + 1) % self.buffer.len() == self.read
-    }
-
-    fn get_free_slot(&mut self) -> &mut [u8] {
-        if self.write >= self.read {
-            &mut self.buffer[self.write..]
-        } else {
-            &mut self.buffer[self.write..self.read - 1]
-        }
-    }
-
-    fn produce(&mut self, written: usize) {
-        // FIXME check written validity
-        self.write = (self.write + written) % self.buffer.len();
-    }
-
-    fn get_data(&self) -> &[u8] {
-        if self.write >= self.read {
-            &self.buffer[self.read..self.write]
-        } else {
-            &self.buffer[self.read..]
-        }
-    }
-
-    fn consume(&mut self, read: usize) {
-        // FIXME check read validity
-        self.read = (self.read + read) % self.buffer.len();
-    }
-}
-
-impl std::io::Write for RingByteBuffer {
-    fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
-        let mut written = 0;
-        let mut src = src;
-        while !src.is_empty() {
-            let dst = self.get_free_slot();
-            let write = if dst.len() < src.len() {
-                dst.copy_from_slice(&src[..dst.len()]);
-                dst.len()
-            } else {
-                dst[..src.len()].copy_from_slice(src);
-                src.len()
-            };
-
-            self.produce(write);
-            written += write;
-            src = &src[write..];
-        }
-
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 // impl Connection {
 //     fn handleClientRequest(&mut self, ctx: &ConnectionContext) -> Result<(), std::io::Error> {
 //         let request = readRequest(&mut self.client_stream)?;
@@ -275,27 +190,36 @@ enum Connection1State {
 }
 
 struct Connection1 {
-    from_client: RingByteBuffer,
-    to_client: RingByteBuffer,
     client_socket: Option<ste::StreamSocket>,
-
     state: Connection1State,
 }
 
 impl Connection1 {
     fn new() -> Connection1 {
         Connection1 {
-            from_client: RingByteBuffer::new(),
-            to_client: RingByteBuffer::new(),
             client_socket: None,
             state: Connection1State::Handshake,
         }
     }
 
-    fn client_handler() -> ste::StreamHandler {
+    fn client_handler(this: Rc<RefCell<Connection1>>) -> ste::StreamHandler {
+        let clone = this.clone();
+        let created = Box::new(move |socket| {
+            clone.borrow_mut().created(socket)
+        });
+        let clone = this.clone();
+        let push = Box::new(move |buf: &[u8]| {
+            clone.borrow_mut().push(buf)
+        });
         ste::StreamHandler {
-            created: || {
-            },
+            created,
+            push,
+            pull: Box::new(move |buf| {
+                this.borrow_mut().pull(buf)
+            }),
+            error: Box::new(move |err| {
+                error!("Connection1 error: {:?}", err);
+            }),
         }
     }
 
@@ -303,70 +227,64 @@ impl Connection1 {
         self.client_socket = Some(socket);
     }
 
-    fn push(&mut self, received: usize) -> Option<&mut [u8]> {
-        debug!("push {}", received);
-        self.from_client.produce(received);
+    fn push(&mut self, buf: &[u8]) -> usize {
+        debug!("push {}", buf.len());
 
-        if received > 0 {
-            match self.state {
-                Connection1State::Handshake => {
-                    // TODO: handle buffer wraparound
-                    let connect = match readConnect(self.from_client.get_data()) {
-                        None => return None,
-                        Some(connect) => {
-                            self.from_client.consume(self.from_client.get_data().len());
-                            connect
-                        },
-                    };
+        match self.state {
+            Connection1State::Handshake => {
+                // TODO: handle buffer wraparound
+                let connect = match readConnect(buf) {
+                    None => return buf.len(),
+                    Some(connect) => {
+                        connect
+                    },
+                };
 
-                    trace!("Received connect: {:?}", connect);
-                    trace!("Written: {}", self.to_client.write(&[0x05u8,0x00]).unwrap());
-                    // TODO: do we need to initiate write?
+                trace!("Received connect: {:?}", connect);
+                // FIXME write(..).unwrap? seriously?
+                trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00]).unwrap());
 
-                    self.state = Connection1State::Request;
-                },
-                Connection1State::Request => {
-                    // TODO: handle buffer wraparound
-                    let request = match readRequest(self.from_client.get_data()) {
-                        Ok(request) => {
-                            self.from_client.consume(self.from_client.get_data().len());
-                            request
-                        },
-                        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            // FIXME: code dedup
-                            return Some(self.from_client.get_free_slot())
-                        },
-                        Err(err) => {
-                            error!("Error reading request: {:?}", err);
-                            return None;
-                        },
-                    };
+                self.state = Connection1State::Request;
+                return buf.len();
+            },
+            Connection1State::Request => {
+                // TODO: handle buffer wraparound
+                let request = match readRequest(buf) {
+                    Ok(request) => {
+                        request
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // FIXME: code dedup
+                        return buf.len();
+                    },
+                    Err(err) => {
+                        error!("Error reading request: {:?}", err);
+                        return buf.len();
+                    },
+                };
 
-                    info!("Read request: {:?}", request);
+                info!("Read request: {:?}", request);
 
-                    // FIXME create socket to remote machine
+                // FIXME create socket to remote machine
 
-                    trace!("Written: {}", self.to_client.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
-                    // TODO: do we need to initiate send?
+                // FIXME write(..).unwrap? seriously?
+                trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
 
-                    self.state = Connection1State::Connect;
-                },
-                Connection1State::Connect => {
-                    unimplemented!("");
-                },
-                Connection1State::Transfer => {
-                    unimplemented!("");
-                }
+                self.state = Connection1State::Connect;
+                return buf.len();
+            },
+            Connection1State::Connect => {
+                unimplemented!("");
+            },
+            Connection1State::Transfer => {
+                unimplemented!("");
             }
         }
-
-        Some(self.from_client.get_free_slot())
     }
 
-    fn pull(&mut self, sent: usize) -> Option<&[u8]> {
-        debug!("pull {}", sent);
-        self.to_client.consume(sent);
-        Some(self.to_client.get_data())
+    fn pull(&mut self, buf: &mut [u8])-> usize {
+        debug!("pull {}", buf.len());
+        0
     }
 }
 
@@ -375,7 +293,7 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
     
     ste.listen(listen, Box::new(|| {
         info!("lol");
-        Ok(Connection1::new().client_handler())
+        Ok(Connection1::client_handler(Rc::new(RefCell::new(Connection1::new()))))
     }))?;
     ste.run()
 }
