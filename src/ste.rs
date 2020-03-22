@@ -18,6 +18,8 @@ use {
     ochenslab::OchenSlab,
 };
 
+use crate::ringbuf;
+
 pub struct StreamSocket {
     socket: SocketRc
 }
@@ -34,7 +36,11 @@ impl StreamSocket {
 
 impl std::io::Write for StreamSocket {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        unimplemented!("");
+        // FIXME use send buffer
+        match self.socket.borrow_mut().deref_mut() {
+            SocketKind::Tcp(sock) => sock.stream_socket.write(buf),
+            _ => { unimplemented!(""); }
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -43,10 +49,10 @@ impl std::io::Write for StreamSocket {
 }
 
 pub struct StreamHandler {
-    created: dyn Fn(StreamSocket),
-    push: dyn Fn(&[u8]) -> Option<usize>, // None -- stop pushing
-    pull: dyn Fn(&mut [u8]) -> Option<usize>, // --//-- pulling
-    error: dyn Fn(std::io::Error),
+    pub created: Box<dyn FnMut(StreamSocket)>,
+    pub push: Box<dyn FnMut(&[u8]) -> usize>,
+    pub pull: Box<dyn FnMut(&mut [u8]) -> usize>,
+    pub error: Box<dyn FnMut(std::io::Error)>,
 }
 
 type ListenCallback = dyn Fn() -> Result<StreamHandler, std::io::Error>;
@@ -58,7 +64,7 @@ struct SocketListener
 }
 
 impl SocketListener {
-    fn new(bind_addr: &str, callback: Box<ListenCallback>) -> Result<SocketListener, Box<dyn std::error::Error>> {
+    fn new(bind_addr: &str, callback: Box<ListenCallback>) -> Result<SocketListener, std::io::Error> {
         let listen_addr = bind_addr.to_socket_addrs()?.next().unwrap();
         Ok(SocketListener {
             listener: mio::net::TcpListener::bind(&listen_addr)?,
@@ -70,14 +76,16 @@ impl SocketListener {
 struct SocketTcp {
     stream_socket: TcpStream,
     stream_handler: StreamHandler,
+    read_buf: ringbuf::RingByteBuffer,
 }
 
 impl SocketTcp {
     fn new(stream_socket: TcpStream, stream_handler: StreamHandler) -> SocketTcp {
-        SocketTcp { stream_socket, stream_handler }
+        SocketTcp { stream_socket, stream_handler, read_buf: ringbuf::RingByteBuffer::new() }
     }
 
     fn handle(&mut self, ready: mio::Ready) -> Result<(), Box<dyn std::error::Error>> {
+        // TODO handle matrix:
         // 1. have data to send
         // 2. have buffer space to receive
         // 3. ready: can send
@@ -90,71 +98,41 @@ impl SocketTcp {
             unimplemented!("readiness hup not implemented");
         }
         if ready.is_readable() {
-            // Allocate buffer for dumping data from socket to
-            match self.stream_handler.push(0) {
-                // Client doesn't want to accept any more data
-                None => {
-                    // TODO Don't try read from socket anymore
-                },
-                Some(buf) => {
-                    // Write as much data as possible (client may accept it in small chunks)
-                    let mut buf = buf;
-                    loop {
-                        // Stop reading from socket if there's no space
-                        if buf.len() == 0 { break; }
+            loop {
+                let mut buffer_full = self.read_buf.is_full();
+                let mut socket_drained = false;
 
-                        // Read data into provided buffer
-                        let read = self.stream_socket.read(buf)?;
+                while !socket_drained && !buffer_full {
+                    let (buf_len, read) = {
+                        let buf = self.read_buf.get_free_slot();
+                        (buf.len(), self.stream_socket.read(buf)?)
+                    };
+                    self.read_buf.produce(read);
 
-                        // Push data to client if read succeeded (client will provide next buffer
-                        // to accept data to)
-                        if read != 0 {
-                            buf = match self.stream_handler.push(read) {
-                                None => { break; }, // TODO Mark client as not accepting data anymore
-                                Some(buf) => buf
-                            };
-                        }
-
-                        // If data read from socket was smaller than buffer size,
-                        // then it means that socket is drained and cannot be read
-                        // until next portion of data arrives from remote host
-                        if read < buf.len() { break; }
-                    }
+                    socket_drained = read < buf_len;
+                    buffer_full = self.read_buf.is_full();
                 }
-            };
+
+                let mut buffer_empty = self.read_buf.is_empty();
+                let mut client_full = false;
+                while !client_full && !buffer_empty {
+                    let (buf_len, consumed) = {
+                        let buf = self.read_buf.get_data();
+                        (buf.len(), (self.stream_handler.push)(buf))
+                    };
+                    self.read_buf.consume(consumed);
+
+                    client_full = consumed < buf_len;
+                    buffer_empty = self.read_buf.is_empty();
+                }
+
+                if (socket_drained && buffer_empty) ||
+                    (client_full && buffer_full) {
+                        break;
+                }
+            }
         }
         if ready.is_writable() {
-            // Get buffer of data to send through socket
-            match self.stream_handler.pull(0) {
-                // Client will not sent data through this socket anymore
-                None => {
-                    // TODO mark this socket as not writable anymore
-                },
-                Some(buf) => {
-                    // Write as much data as possible (client may produce it in small chunks)
-                    let mut buf = buf;
-                    loop {
-                        // Stop sending to socket if there's nothing to send lol
-                        if buf.len() == 0 { break; }
-
-                        // Write data to socket
-                        let written = self.stream_socket.write(buf)?;
-
-                        // Let client know how much data was send (client will provide next chunk)
-                        if written != 0 {
-                            buf = match self.stream_handler.pull(written) {
-                                None => { break; }, // TODO Mark client as not accepting data anymore
-                                Some(buf) => buf
-                            };
-                        }
-
-                        // If data written to socket was smaller than data to send,
-                        // then it means that socket is full and won't accept any
-                        // more data now
-                        if written < buf.len() { break; }
-                    }
-                }
-            };
         }
         Ok(())
     }
@@ -177,7 +155,7 @@ impl SocketKind {
         match self {
             SocketKind::Tcp(ref mut stream) => {
                 let handler = &mut stream.stream_handler;
-                handler.created(socket)
+                (handler.created)(socket)
             }
             SocketKind::Listener(_) => {},
         }
