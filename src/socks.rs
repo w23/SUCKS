@@ -5,14 +5,6 @@ use {
         net::{IpAddr, ToSocketAddrs},
         rc::Rc,
     },
-    mio::{
-        Events, Poll, PollOpt, Ready, Token,
-        net::{
-            //UdpSocket,
-            TcpStream, TcpListener,
-        },
-    },
-    ochenslab::OchenSlab,
     log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
@@ -290,7 +282,7 @@ impl Connection1 {
 
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ste = ste::Ste::new(128).unwrap();
-    
+
     ste.listen(listen, Box::new(|| {
         info!("lol");
         Ok(Connection1::client_handler(Rc::new(RefCell::new(Connection1::new()))))
