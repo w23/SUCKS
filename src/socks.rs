@@ -1,11 +1,11 @@
 use {
     std::{
-        cell::{RefCell},
+        // cell::{RefCell},
         io::{Write, Read, Cursor, Seek},
         net::{IpAddr, ToSocketAddrs},
-        rc::Rc,
+        // rc::Rc,
     },
-    log::{info, trace, warn, error, debug},
+    // log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
 
@@ -173,119 +173,119 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 // }
 //
 // const LISTENER: Token = Token(65535);
-
-enum Connection1State {
-    Handshake,
-    Request,
-    Connect,
-    Transfer
-}
-
-struct Connection1 {
-    client_socket: Option<ste::StreamSocket>,
-    state: Connection1State,
-}
-
-impl Connection1 {
-    fn new() -> Connection1 {
-        Connection1 {
-            client_socket: None,
-            state: Connection1State::Handshake,
-        }
-    }
-
-    fn client_handler(this: Rc<RefCell<Connection1>>) -> ste::StreamHandler {
-        let clone = this.clone();
-        let created = Box::new(move |socket| {
-            clone.borrow_mut().created(socket)
-        });
-        let clone = this.clone();
-        let push = Box::new(move |buf: &[u8]| {
-            clone.borrow_mut().push(buf)
-        });
-        ste::StreamHandler {
-            created,
-            push,
-            pull: Box::new(move |buf| {
-                this.borrow_mut().pull(buf)
-            }),
-            error: Box::new(move |err| {
-                error!("Connection1 error: {:?}", err);
-            }),
-        }
-    }
-
-    fn created(&mut self, socket: ste::StreamSocket) {
-        self.client_socket = Some(socket);
-    }
-
-    fn push(&mut self, buf: &[u8]) -> usize {
-        debug!("push {}", buf.len());
-
-        match self.state {
-            Connection1State::Handshake => {
-                // TODO: handle buffer wraparound
-                let connect = match readConnect(buf) {
-                    None => return buf.len(),
-                    Some(connect) => {
-                        connect
-                    },
-                };
-
-                trace!("Received connect: {:?}", connect);
-                // FIXME write(..).unwrap? seriously?
-                trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00]).unwrap());
-
-                self.state = Connection1State::Request;
-                return buf.len();
-            },
-            Connection1State::Request => {
-                // TODO: handle buffer wraparound
-                let request = match readRequest(buf) {
-                    Ok(request) => {
-                        request
-                    },
-                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        // FIXME: code dedup
-                        return buf.len();
-                    },
-                    Err(err) => {
-                        error!("Error reading request: {:?}", err);
-                        return buf.len();
-                    },
-                };
-
-                info!("Read request: {:?}", request);
-
-                // FIXME create socket to remote machine
-
-                // FIXME write(..).unwrap? seriously?
-                trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
-
-                self.state = Connection1State::Connect;
-                return buf.len();
-            },
-            Connection1State::Connect => {
-                unimplemented!("");
-            },
-            Connection1State::Transfer => {
-                unimplemented!("");
-            }
-        }
-    }
-
-    fn pull(&mut self, buf: &mut [u8])-> usize {
-        debug!("pull {}", buf.len());
-        0
-    }
-}
-
+//
+// enum Connection1State {
+//     Handshake,
+//     Request,
+//     Connect,
+//     Transfer
+// }
+//
+// struct Connection1 {
+//     client_socket: Option<ste::StreamSocket>,
+//     state: Connection1State,
+// }
+//
+// impl Connection1 {
+//     fn new() -> Connection1 {
+//         Connection1 {
+//             client_socket: None,
+//             state: Connection1State::Handshake,
+//         }
+//     }
+//
+//     fn client_handler(this: Rc<RefCell<Connection1>>) -> ste::StreamHandler {
+//         let clone = this.clone();
+//         let created = Box::new(move |socket| {
+//             clone.borrow_mut().created(socket)
+//         });
+//         let clone = this.clone();
+//         let push = Box::new(move |buf: &[u8]| {
+//             clone.borrow_mut().push(buf)
+//         });
+//         ste::StreamHandler {
+//             created,
+//             push,
+//             pull: Box::new(move |buf| {
+//                 this.borrow_mut().pull(buf)
+//             }),
+//             error: Box::new(move |err| {
+//                 error!("Connection1 error: {:?}", err);
+//             }),
+//         }
+//     }
+//
+//     fn created(&mut self, socket: ste::StreamSocket) {
+//         self.client_socket = Some(socket);
+//     }
+//
+//     fn push(&mut self, buf: &[u8]) -> usize {
+//         debug!("push {}", buf.len());
+//
+//         match self.state {
+//             Connection1State::Handshake => {
+//                 // TODO: handle buffer wraparound
+//                 let connect = match readConnect(buf) {
+//                     None => return buf.len(),
+//                     Some(connect) => {
+//                         connect
+//                     },
+//                 };
+//
+//                 trace!("Received connect: {:?}", connect);
+//                 // FIXME write(..).unwrap? seriously?
+//                 trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00]).unwrap());
+//
+//                 self.state = Connection1State::Request;
+//                 return buf.len();
+//             },
+//             Connection1State::Request => {
+//                 // TODO: handle buffer wraparound
+//                 let request = match readRequest(buf) {
+//                     Ok(request) => {
+//                         request
+//                     },
+//                     Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+//                         // FIXME: code dedup
+//                         return buf.len();
+//                     },
+//                     Err(err) => {
+//                         error!("Error reading request: {:?}", err);
+//                         return buf.len();
+//                     },
+//                 };
+//
+//                 info!("Read request: {:?}", request);
+//
+//                 // FIXME create socket to remote machine
+//
+//                 // FIXME write(..).unwrap? seriously?
+//                 trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
+//
+//                 self.state = Connection1State::Connect;
+//                 return buf.len();
+//             },
+//             Connection1State::Connect => {
+//                 unimplemented!("");
+//             },
+//             Connection1State::Transfer => {
+//                 unimplemented!("");
+//             }
+//         }
+//     }
+//
+//     fn pull(&mut self, buf: &mut [u8])-> usize {
+//         debug!("pull {}", buf.len());
+//         0
+//     }
+// }
+//
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ste = ste::Ste::new(128).unwrap();
 
-    ste.listen(listen, Box::new(|| {
-        info!("lol");
-        Ok(Connection1::client_handler(Rc::new(RefCell::new(Connection1::new()))))
-    }))?;
+    // ste.listen(listen, Box::new(|| {
+    //     info!("lol");
+    //     Ok(Connection1::client_handler(Rc::new(RefCell::new(Connection1::new()))))
+    // }))?;
     ste.run()
 }
