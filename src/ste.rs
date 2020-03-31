@@ -34,9 +34,9 @@ impl MetaSocket {
         Ok(MetaSocket{ context, socket: MetaSocketKind::Listener(mio::net::TcpListener::bind(listen_addr)?)})
     }
     fn register(&mut self, registry: &mio::Registry, token: Token) -> std::io::Result<()> {
-        match self.socket {
-            MetaSocketKind::Listener(listen) => registry.register(&mut listen, token, INTERESTS),
-            MetaSocketKind::Tcp(stream) => registry.register(&mut stream, token, INTERESTS),
+        match &mut self.socket {
+            MetaSocketKind::Listener(listen) => registry.register(listen, token, INTERESTS),
+            MetaSocketKind::Tcp(stream) => registry.register(stream, token, INTERESTS),
         }
     }
 }
@@ -57,6 +57,14 @@ impl<T> Versioned<T> {
         }
 
         return Some(&self.value);
+    }
+
+    fn get_mut(&mut self, seq: usize) -> Option<&mut T> {
+        if self.seq != seq {
+            return None;
+        }
+
+        return Some(&mut self.value);
     }
 }
 
@@ -153,7 +161,7 @@ impl Ste {
         };
 
         let token = Token(index + (seq << 16));
-        let socket = self.sockets.get_mut(index).unwrap().get(seq).unwrap();
+        let socket = self.sockets.get_mut(index).unwrap().get_mut(seq).unwrap();
         socket.register(&self.poll.registry(), token);
 
         info!("S{}: token {} for listened socket", seq, token.0);
@@ -203,7 +211,7 @@ impl Ste {
             trace!("loop. sockets={}", self.sockets.len());
             self.poll.poll(&mut events, None).unwrap();
 
-            for event in &events {
+            'events: for event in &events {
                 let t = event.token().0;
                 let seq = t >> 16;
                 let index = (t & 0xffff) % self.sockets.capacity();
@@ -218,8 +226,8 @@ impl Ste {
                     }
                 };
 
-                let sock: &mut MetaSocket = match sock.get(seq) {
-                    Some(sock) => &mut sock,
+                let sock: &mut MetaSocket = match sock.get_mut(seq) {
+                    Some(sock) => sock,
                     None => {
                         warn!("S{} stale seq {} received, slot has {}", index, seq, sock.seq);
                         continue;
@@ -235,14 +243,34 @@ impl Ste {
                     }
                 };
 
-                let context: &mut Box<dyn Context> = match context.get(sock.context.seq) {
-                    Some(context) => &mut context,
+                let context: &mut Box<dyn Context> = match context.get_mut(sock.context.seq) {
+                    Some(context) => context,
                     None => {
                         error!("C{} is stale, expected seq is {} but got {} and associated socket still exists", sock.context.index, sock.context.seq, context.seq);
                         unimplemented!("FIXME this socket should die now");
                         //continue;
                     }
                 };
+
+                match &sock.socket {
+                    MetaSocketKind::Listener(sock) => {
+                        loop {
+                            let accepted = match sock.accept() {
+                                Ok((socket, _)) => socket,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                                Err(e) => {
+                                    //return Err(Box::new(e))
+                                    error!("S{}, cannot accept: {:?}", index, e);
+                                    // FIXME notify context
+                                    continue 'events;
+                                }
+                            };
+                        }
+                    },
+                    MetaSocketKind::Tcp(sock) => {
+                    }
+                }
+
 
                 // let result = match sock.deref_mut() {
                 //     MetaSocket::Listener(listen) => self.handleListen(event.readiness(), listen),
