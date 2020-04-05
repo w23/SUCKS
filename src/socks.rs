@@ -5,10 +5,11 @@ use {
         net::{IpAddr, ToSocketAddrs},
         // rc::Rc,
     },
-    // log::{info, trace, warn, error, debug},
+    log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
 
+use crate::ringbuf;
 use crate::ste;
 
 #[derive(Debug)]
@@ -172,29 +173,27 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 //     }
 // }
 //
-// const LISTENER: Token = Token(65535);
-//
-// enum Connection1State {
+// enum ConnectionState {
 //     Handshake,
 //     Request,
 //     Connect,
 //     Transfer
 // }
 //
-// struct Connection1 {
+// struct Connection {
 //     client_socket: Option<ste::StreamSocket>,
-//     state: Connection1State,
+//     state: ConnectionState,
 // }
 //
-// impl Connection1 {
-//     fn new() -> Connection1 {
-//         Connection1 {
+// impl Connection {
+//     fn new() -> Connection {
+//         Connection {
 //             client_socket: None,
-//             state: Connection1State::Handshake,
+//             state: ConnectionState::Handshake,
 //         }
 //     }
 //
-//     fn client_handler(this: Rc<RefCell<Connection1>>) -> ste::StreamHandler {
+//     fn client_handler(this: Rc<RefCell<Connection>>) -> ste::StreamHandler {
 //         let clone = this.clone();
 //         let created = Box::new(move |socket| {
 //             clone.borrow_mut().created(socket)
@@ -210,7 +209,7 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 //                 this.borrow_mut().pull(buf)
 //             }),
 //             error: Box::new(move |err| {
-//                 error!("Connection1 error: {:?}", err);
+//                 error!("Connection error: {:?}", err);
 //             }),
 //         }
 //     }
@@ -223,7 +222,7 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 //         debug!("push {}", buf.len());
 //
 //         match self.state {
-//             Connection1State::Handshake => {
+//             ConnectionState::Handshake => {
 //                 // TODO: handle buffer wraparound
 //                 let connect = match readConnect(buf) {
 //                     None => return buf.len(),
@@ -236,10 +235,10 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 //                 // FIXME write(..).unwrap? seriously?
 //                 trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00]).unwrap());
 //
-//                 self.state = Connection1State::Request;
+//                 self.state = ConnectionState::Request;
 //                 return buf.len();
 //             },
-//             Connection1State::Request => {
+//             ConnectionState::Request => {
 //                 // TODO: handle buffer wraparound
 //                 let request = match readRequest(buf) {
 //                     Ok(request) => {
@@ -262,13 +261,13 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 //                 // FIXME write(..).unwrap? seriously?
 //                 trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
 //
-//                 self.state = Connection1State::Connect;
+//                 self.state = ConnectionState::Connect;
 //                 return buf.len();
 //             },
-//             Connection1State::Connect => {
+//             ConnectionState::Connect => {
 //                 unimplemented!("");
 //             },
-//             Connection1State::Transfer => {
+//             ConnectionState::Transfer => {
 //                 unimplemented!("");
 //             }
 //         }
@@ -279,13 +278,128 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 //         0
 //     }
 // }
-//
+
+enum ConnectionState {
+    Handshake,
+    Request,
+    Connect,
+    Transfer
+}
+
+struct Connection {
+    state: ConnectionState,
+    client: ste::SocketHandle,
+    buf: ringbuf::RingByteBuffer,
+}
+
+impl Connection {
+    fn new(client: ste::SocketHandle) -> Connection {
+        Connection {
+            state: ConnectionState::Handshake,
+            client,
+            buf: ringbuf::RingByteBuffer::new(),
+        }
+    }
+}
+
+impl ste::Context for Connection {
+    fn registered(&mut self, handle: ste::ContextHandle) {
+        info!("Handle: {:?}", handle);
+    }
+
+    fn accept(&mut self, socket: ste::SocketHandle) -> Option<Box<dyn ste::Context>> {
+        info!("Accept: {:?}", socket);
+        None
+    }
+
+    fn get_buffer(&mut self) -> &mut [u8] {
+        self.buf.get_free_slot()
+    }
+
+    fn buffer_read(&mut self, read: usize) {
+        self.buf.produce(read);
+
+        match self.state {
+            ConnectionState::Handshake => {
+                let buf = self.buf.get_data();
+                let connect = match readConnect(buf) {
+                    Some(connect) => {
+                        connect
+                    },
+                    None => return,
+                };
+
+                trace!("Received connect: {:?}", connect);
+                // FIXME write(..).unwrap? seriously?
+                //trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00]).unwrap());
+
+                self.state = ConnectionState::Request;
+            },
+            ConnectionState::Request => {
+                // TODO: handle buffer wraparound
+                let buf = self.buf.get_data();
+                let request = match readRequest(buf) {
+                    Ok(request) => {
+                        request
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return;
+                    },
+                    Err(err) => {
+                        error!("Error reading request: {:?}", err);
+                        unimplemented!();
+                        //return;
+                    },
+                };
+
+                info!("Read request: {:?}", request);
+
+                // FIXME create socket to remote machine
+
+                // FIXME write(..).unwrap? seriously?
+                //trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
+
+                self.state = ConnectionState::Connect;
+            },
+            ConnectionState::Connect => {
+                unimplemented!("");
+            },
+            ConnectionState::Transfer => {
+                unimplemented!("");
+            }
+        }
+
+    }
+}
+
+struct ListenContext {
+}
+
+impl ste::Context for ListenContext {
+    fn registered(&mut self, handle: ste::ContextHandle) {
+        info!("Handle: {:?}", handle);
+    }
+
+    fn accept(&mut self, socket: ste::SocketHandle) -> Option<Box<dyn ste::Context>> {
+        info!("Accept: {:?}", socket);
+        Some(Box::new(Connection::new(socket)))
+    }
+
+    fn get_buffer(&mut self) -> &mut [u8] {
+        unimplemented!();
+    }
+
+    fn buffer_read(&mut self, read: usize) {
+        unimplemented!();
+    }
+}
+
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ste = ste::Ste::new(128).unwrap();
 
-    // ste.listen(listen, Box::new(|| {
-    //     info!("lol");
-    //     Ok(Connection1::client_handler(Rc::new(RefCell::new(Connection1::new()))))
-    // }))?;
+    let context_handle = ste.register_context(Box::new(ListenContext{})).unwrap();
+    let listen = ste.listen(listen, context_handle);
+    info!("Listening socket: {:?}", listen);
+
     ste.run()
 }
