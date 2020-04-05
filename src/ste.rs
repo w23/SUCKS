@@ -1,7 +1,7 @@
 use {
     std::{
         //borrow::{BorrowMut},
-        // io::{Write, Read, Cursor, Seek},
+        io::{Write, Read},
         net::{/*IpAddr,*/ ToSocketAddrs},
         // ops::DerefMut,
     },
@@ -18,6 +18,7 @@ use {
 
 const INTERESTS: mio::Interest = mio::Interest::READABLE.add(mio::Interest::WRITABLE);
 
+#[derive(Debug)]
 enum SocketType {
     TcpListener = 1,
     TcpStream = 2,
@@ -25,8 +26,8 @@ enum SocketType {
 
 // FIXME limit seq bits
 fn make_token(index: usize, seq: usize, kind: SocketType) -> Token {
-    assert!(index > 0x10000);
-    Token((seq << 18) + (index << 2) + kind as usize)
+    assert!(index < 0x10000);
+    Token((seq << 18) | (index << 2) | kind as usize)
 }
 
 fn parse_token(token: Token) -> (usize, usize, SocketType) {
@@ -35,7 +36,7 @@ fn parse_token(token: Token) -> (usize, usize, SocketType) {
         2 => SocketType::TcpStream,
         _ => panic!("Unexpected value"),
     };
-    (token.0 >> 18, (token.0 >> 2) & 0xffff, kind)
+    ((token.0 >> 2) & 0xffff, token.0 >> 18, kind)
 }
 
 struct SocketTcpListen {
@@ -101,9 +102,12 @@ impl<T> Versioned<T> {
 }
 
 pub trait Context {
-    fn accept(&mut self, socket: SocketHandle);
+    fn registered(&mut self, handle: ContextHandle);
+    fn accept(&mut self, socket: SocketHandle) -> Option<Box<dyn Context>>;
+    fn get_buffer(&mut self) -> &mut [u8];
+    fn buffer_read(&mut self, read: usize);
     //fn event(&mut self, socket: SocketHandle);
-    // pub created: Box<dyn FnMut(StreamSocket)>,
+    // pub registered: Box<dyn FnMut(StreamSocket)>,
     // pub push: Box<dyn FnMut(&[u8]) -> usize>,
     // pub pull: Box<dyn FnMut(&mut [u8]) -> usize>,
     // pub error: Box<dyn FnMut(std::io::Error)>,
@@ -180,7 +184,7 @@ fn get_ref_by_handle<H: Handle, S>(slab: &OchenSlab::<Versioned<S>>, handle: H) 
     let value = match slab.get(handle.index()) {
         Some(value) => value,
         None => {
-            warn!("S{}: stale event, no such valueet", handle.index());
+            warn!("S{}: stale event, no such value", handle.index());
             return None;
         }
     };
@@ -200,7 +204,7 @@ fn get_ref_mut_by_handle<H: Handle, S>(slab: &mut OchenSlab::<Versioned<S>>, han
     let value = match slab.get_mut(handle.index()) {
         Some(value) => value,
         None => {
-            warn!("S{}: stale event, no such valueet", handle.index());
+            warn!("S{}: stale event, no such value", handle.index());
             return None;
         }
     };
@@ -236,7 +240,9 @@ impl Ste {
         };
 
         info!("C{}: [{}]", seq, index);
-        Ok(ContextHandle::new(index, seq))
+        let handle = ContextHandle::new(index, seq);
+        self.contexts.get_mut(index).unwrap().get_mut(seq).unwrap().registered(handle);
+        Ok(handle)
     }
 
     pub fn connect_stream(&mut self, address: &str, context: ContextHandle) -> Result<SocketHandle, std::io::Error> {
@@ -262,15 +268,6 @@ impl Ste {
             None => return,
         };
 
-        let context = match get_ref_mut_by_handle(&mut self.contexts, socket.context) {
-            Some(context) => context,
-            None => {
-                error!("C{} is stale, but associated socket still exists", socket.context.index);
-                unimplemented!("FIXME this socket should die now");
-                //return;
-            }
-        };
-
         loop {
             let accepted = match socket.socket.accept() {
                 Ok((socket, _)) => socket,
@@ -291,12 +288,81 @@ impl Ste {
                 }
             };
 
-            context.accept(SocketHandle{index, seq});
+            let new_socket_handle = SocketHandle{index, seq};
+
+            let context = match get_ref_mut_by_handle(&mut self.contexts, socket.context) {
+                Some(context) => context,
+                None => {
+                    error!("C{} is stale, but associated socket still exists", socket.context.index);
+                    unimplemented!("FIXME this socket should die now");
+                    //return;
+                }
+            };
+
+            let context = context.accept(SocketHandle{index, seq});
+            if context.is_some() {
+                let seq = self.seq.next();
+                let index = match self.contexts.insert(Versioned::new(seq, context.unwrap())) {
+                    Some(index) => index,
+                    None => {
+                        error!("Cannot store new context");
+                        unimplemented!("FIXME destroy new socket");
+                        //continue;
+                    },
+                };
+
+                self.contexts.get_mut(index).unwrap().get_mut(seq).unwrap().registered(ContextHandle{index, seq});
+
+                {
+                    info!("registering socket index={} seq={}", new_socket_handle.index, new_socket_handle.seq);
+                    let socket = self.streams.get_mut(new_socket_handle.index).unwrap().get_mut(new_socket_handle.seq).unwrap();
+                    socket.register(&self.poll.registry(), new_socket_handle.index, new_socket_handle.seq).unwrap();
+                    socket.context = ContextHandle{index, seq};
+                }
+            }
         }
     }
 
+    // TODO: need to separate missing socket and missing context
+    // fn get_socket_context_mut(&mut self, socket_handle: SocketHandle) -> Option<&mut Box<dyn Context>> {
+    //     let socket = match get_ref_by_handle(&self.listeners, socket_handle) {
+    //         Some(sock) => sock,
+    //         None => return None,
+    //     };
+    //
+    //     get_ref_mut_by_handle(&mut self.contexts, socket.context)
+    // }
+
     fn handleStream(&mut self, socket_handle: SocketHandle, event: &mio::event::Event) {
-        unimplemented!();
+        let socket = match get_ref_mut_by_handle(&mut self.streams, socket_handle) {
+            Some(sock) => sock,
+            None => return,
+        };
+
+        let context = match get_ref_mut_by_handle(&mut self.contexts, socket.context) {
+            Some(context) => context,
+            None => {
+                error!("C{} is stale, but associated socket still exists", socket.context.index);
+                unimplemented!("FIXME this socket should die now");
+                //return;
+            }
+        };
+
+        if event.is_error() {
+            unimplemented!();
+        }
+
+        if event.is_readable() {
+            let buf = context.get_buffer();
+            let read = match socket.socket.read(buf) {
+                Ok(read) => read,
+                Err(e) => {
+                    error!("Error: {:?}", e);
+                    0
+                },
+            };
+            context.buffer_read(read);
+        }
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -304,11 +370,18 @@ impl Ste {
 
         loop {
             trace!("loop. listeners={} streams={}", self.listeners.len(), self.streams.len());
-            self.poll.poll(&mut events, None).unwrap();
+            match self.poll.poll(&mut events, None) {
+                Err(e) => {
+                    error!("poll error: {:?}", e);
+                    continue;
+                },
+                _ => {},
+            }
 
             for event in &events {
                 debug!("event: {:?}", event);
                 let (index, seq, socket_type) = parse_token(event.token());
+                debug!("index={} seq={} type={:?}", index, seq, socket_type);
                 let socket_handle = SocketHandle{ index, seq };
 
                 match socket_type {
