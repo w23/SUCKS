@@ -5,6 +5,11 @@ use {
         net::{IpAddr, ToSocketAddrs},
         // rc::Rc,
     },
+    mio::{
+        net::{
+            TcpStream, TcpListener,
+        },
+    },
     log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
@@ -282,48 +287,104 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 enum ConnectionState {
     Handshake,
     Request,
-    Connect,
-    Transfer
+    Transfer,
+    TransferTail,
 }
 
 struct Connection {
+    handle: Option<ste::Handle>,
     state: ConnectionState,
-    client: ste::SocketHandle,
-    buf: ringbuf::RingByteBuffer,
+    client: TcpStream,
+    remote: Option<TcpStream>,
+    client_read_buf: ringbuf::RingByteBuffer,
+    client_write_buf: ringbuf::RingByteBuffer,
 }
 
 impl Connection {
-    fn new(client: ste::SocketHandle) -> Connection {
+    fn new(client: TcpStream) -> Connection {
         Connection {
+            handle: None,
             state: ConnectionState::Handshake,
             client,
-            buf: ringbuf::RingByteBuffer::new(),
+            remote: None,
+            client_read_buf: ringbuf::RingByteBuffer::new(),
+            client_write_buf: ringbuf::RingByteBuffer::new(),
         }
     }
 }
 
 impl ste::Context for Connection {
-    fn registered(&mut self, handle: ste::ContextHandle) {
+    fn registered(&mut self, ste: &mut ste::Ste, handle: ste::Handle) {
         info!("Handle: {:?}", handle);
+        self.handle = Some(handle);
+        ste.register_source(handle, &mut self.client, 0);
     }
 
-    fn accept(&mut self, socket: ste::SocketHandle) -> Option<Box<dyn ste::Context>> {
-        info!("Accept: {:?}", socket);
-        None
+    fn event(&mut self, ste: &mut ste::Ste, token: usize, event: &mio::event::Event) {
+        match token {
+            0 => self.handleClient(ste, event),
+            1 => self.handleServer(event),
+            _ => error!("Unexpected socket token {}", token)
+        }
+    }
+}
+
+impl Connection {
+    fn handleServer(&mut self, event: &mio::event::Event) {
+        unimplemented!();
     }
 
-    fn get_buffer(&mut self) -> &mut [u8] {
-        self.buf.get_free_slot()
-    }
+    fn handleClient(&mut self, ste: &mut ste::Ste, event: &mio::event::Event) {
+        if event.is_readable() {
+            loop {
+                let (read, drained) = {
+                    let buf = self.client_read_buf.get_free_slot();
+                    if buf.len() == 0 { break; }
+                    let read = match self.client.read(buf) {
+                        Ok(size) => size,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                        Err(e) => {
+                            error!("Cannot read from client socket: {:?}", e);
+                            // FIXME what to do now?!
+                            return;
+                        }
+                    };
+                    (read, read < buf.len())
+                };
+                self.client_read_buf.produce(read);
+                if drained { break; }
+            }
+        }
 
-    fn buffer_read(&mut self, read: usize) {
-        self.buf.produce(read);
+        if event.is_writable() {
+            loop {
+                let (written, full) = {
+                    let buf = self.client_write_buf.get_data();
+                    if buf.len() == 0 { break; }
+                    let written = match self.client.write(buf) {
+                        Ok(size) => size,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                        Err(e) => {
+                            error!("Cannot write to client socket: {:?}", e);
+                            // FIXME what to do now?!
+                            return;
+                        }
+                    };
+                    (written, written < buf.len())
+                };
+                self.client_read_buf.consume(written);
+                if full { break; }
+            }
+        }
 
         match self.state {
             ConnectionState::Handshake => {
-                let buf = self.buf.get_data();
+                let buf = self.client_read_buf.get_data();
                 let connect = match readConnect(buf) {
                     Some(connect) => {
+                        // FIXME consume properly
+                        let to_drop = buf.len();
+                        self.client_read_buf.consume(to_drop);
                         connect
                     },
                     None => return,
@@ -331,22 +392,25 @@ impl ste::Context for Connection {
 
                 trace!("Received connect: {:?}", connect);
                 // FIXME write(..).unwrap? seriously?
-                //trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00]).unwrap());
+                trace!("Written: {}", self.client.write(&[0x05u8,0x00]).unwrap());
 
                 self.state = ConnectionState::Request;
             },
             ConnectionState::Request => {
                 // TODO: handle buffer wraparound
-                let buf = self.buf.get_data();
+                let buf = self.client_read_buf.get_data();
                 let request = match readRequest(buf) {
                     Ok(request) => {
+                        // FIXME consume properly
+                        let to_drop = buf.len();
+                        self.client_read_buf.consume(to_drop);
                         request
                     },
                     Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                         return;
                     },
                     Err(err) => {
-                        error!("Error reading request: {:?}", err);
+                        error!("Error reading request: {:?}, {:?}", err, buf);
                         unimplemented!();
                         //return;
                     },
@@ -355,14 +419,27 @@ impl ste::Context for Connection {
                 info!("Read request: {:?}", request);
 
                 // FIXME create socket to remote machine
+                //ste.connect_stream(/*&request.addr*/ "localhost", self.handle.unwrap());
+                self.remote = Some(match TcpStream::connect(request.socket_addr()) {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        error!("Cannot connect to remote {:?}: {:?}", request, e);
+                        unimplemented!();
+                    }
+                });
+
+                match ste.register_source(self.handle.unwrap(), self.remote.as_mut().unwrap(), 1) {
+                    Err(e) => {
+                        error!("Cannot register remote socket {:?}: {:?}", request, e);
+                        unimplemented!();
+                    }
+                    _ => {},
+                }
 
                 // FIXME write(..).unwrap? seriously?
-                //trace!("Written: {}", self.client_socket.as_mut().unwrap().write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
+                trace!("Written: {}", self.client.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
 
-                self.state = ConnectionState::Connect;
-            },
-            ConnectionState::Connect => {
-                unimplemented!("");
+                self.state = ConnectionState::Transfer;
             },
             ConnectionState::Transfer => {
                 unimplemented!("");
@@ -373,33 +450,63 @@ impl ste::Context for Connection {
 }
 
 struct ListenContext {
+    socket: mio::net::TcpListener,
+}
+
+impl ListenContext {
+    fn listen(bind_addr: &str) -> Result<ListenContext, std::io::Error> {
+        let listen_addr = bind_addr.to_socket_addrs()?.next().unwrap();
+        Ok(ListenContext{
+            socket: mio::net::TcpListener::bind(listen_addr)?
+        })
+    }
 }
 
 impl ste::Context for ListenContext {
-    fn registered(&mut self, handle: ste::ContextHandle) {
-        info!("Handle: {:?}", handle);
+    fn registered(&mut self, ste: &mut ste::Ste, handle: ste::Handle) {
+        ste.register_source(handle, &mut self.socket, 0).unwrap();
     }
 
-    fn accept(&mut self, socket: ste::SocketHandle) -> Option<Box<dyn ste::Context>> {
-        info!("Accept: {:?}", socket);
-        Some(Box::new(Connection::new(socket)))
-    }
+    fn event(&mut self, ste: &mut ste::Ste, token: usize, event: &mio::event::Event) {
+        debug!("token:{}, event:{:?}", token, event);
 
-    fn get_buffer(&mut self) -> &mut [u8] {
-        unimplemented!();
-    }
+        // FIXME if error
 
-    fn buffer_read(&mut self, read: usize) {
-        unimplemented!();
+        if !event.is_readable() {
+            error!("what");
+            return;
+        }
+
+        loop {
+            let accepted = match self.socket.accept() {
+                Ok((socket, _)) => socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
+                Err(e) => {
+                    error!("cannot accept: {:?}", e);
+                    // FIXME handle?
+                    return;
+                }
+            };
+
+            match ste.register_context(Box::new(Connection::new(accepted))) {
+                Err(e) => {
+                    error!("Cannot register new connection: {:?}", e);
+                    // FIXME handle?
+                },
+                _ => {}
+            }
+        }
     }
 }
 
 pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut ste = ste::Ste::new(128).unwrap();
 
-    let context_handle = ste.register_context(Box::new(ListenContext{})).unwrap();
-    let listen = ste.listen(listen, context_handle);
-    info!("Listening socket: {:?}", listen);
+    let context_handle = ste.register_context(Box::new(ListenContext::listen(listen)?))?;
+    //let context = ste.get_context(context_handle)?;
+
+    //let listen = ste.listen(listen, context_handle);
+    //info!("Listening socket: {:?}", listen);
 
     ste.run()
 }
