@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 use std::env;
-use env_logger;
+//use env_logger;
 
 mod socks;
 mod exit;
