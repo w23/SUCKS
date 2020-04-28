@@ -239,6 +239,16 @@ impl Connection {
         }
     }
 
+    fn disconnect(&mut self, ste: &mut ste::Ste) {
+        // client: ReadWritePipe<TcpStream>,
+        // remote: Option<ReadWritePipe<TcpStream>>,
+
+        match self.handle {
+            Some(handle) => { ste.deregister_context(handle); },
+            _ => {},
+        }
+    }
+
     fn transfer(&mut self) {
         let remote = self.remote.as_mut().unwrap();
         let client = &mut self.client;
