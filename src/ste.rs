@@ -140,6 +140,8 @@ impl<T> VersionedSlab<T> {
 
         Some(value)
     }
+
+    // FIXME add insert, remove with seq
 }
 
 pub trait Context {
@@ -150,7 +152,7 @@ pub trait Context {
 pub struct Ste {
     poll: Poll,
     mapping_seq: Sequence,
-    contexts_seq: Sequence,
+    contexts_seq: Sequence, // FIXME hide these into versioned slab
     mapping: VersionedSlab<SourceMapping>,
     contexts: VersionedSlab<Rc<RefCell<Box<dyn Context>>>>,
 }
@@ -180,7 +182,7 @@ impl Ste {
         Ok(handle)
     }
 
-    pub fn register_source(&mut self, context: Handle, source: &mut dyn mio::event::Source, token: usize) -> Result<(), std::io::Error> {
+    pub fn register_source(&mut self, context: Handle, source: &mut dyn mio::event::Source, token: usize) -> Result<Handle, std::io::Error> {
         const INTERESTS: mio::Interest = mio::Interest::READABLE.add(mio::Interest::WRITABLE);
 
         if self.contexts.get_ref_by_handle(context).is_none() {
@@ -195,7 +197,36 @@ impl Ste {
             }
         };
 
-        self.poll.registry().register(source, Token::from(Handle{index: mapping, seq: seq}), INTERESTS)
+        let handle = Handle{index: mapping, seq: seq};
+        match self.poll.registry().register(source, Token::from(handle), INTERESTS) {
+            Ok(_) => Ok(handle),
+            Err(e) => {
+                self.mapping.slab.remove(mapping);
+                Err(e)
+            },
+        }
+    }
+
+    // TODO RegisteredSource type?
+    pub fn deregister_source(&mut self, source_handle: Handle, source: &mut dyn mio::event::Source) -> std::io::Result<()> {
+        let mapping = match self.mapping.get_ref_by_handle(source_handle) {
+            None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "Source not found")),
+            Some(mapping) => mapping,
+        };
+
+        self.mapping.slab.remove(source_handle.index);
+        self.poll.registry().deregister(source)
+    }
+
+    pub fn deregister_context(&mut self, context: Handle) -> std::io::Result<()> {
+        // FIXME check that all sources have been deregistered
+        if self.contexts.get_ref_by_handle(context).is_none() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Context not found"));
+        }
+
+        // FIXME native remove
+        self.contexts.slab.remove(context.index);
+        Ok(())
     }
 
     // FIXME deregister:
