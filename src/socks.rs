@@ -183,6 +183,16 @@ impl<T: Read+Write> ReadWritePipe<T> {
         }
         Ok(total)
     }
+
+    fn feed<U: Read+Write>(&mut self, from: &mut ReadWritePipe<U>, buffer: &mut RingByteBuffer) -> (std::io::Result<usize>, std::io::Result<usize>) {
+        // FIXME compute sum of all sent
+        loop {
+            let ret = (from.read(buffer), self.write(buffer));
+            if ret.0.is_err() || ret.1.is_err() || *ret.0.as_ref().ok().unwrap() == 0 || *ret.1.as_ref().ok().unwrap() == 0 {
+                return ret;
+            }
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -229,31 +239,28 @@ impl Connection {
         }
     }
 
+    fn transfer(&mut self) {
+        let remote = self.remote.as_mut().unwrap();
+        let client = &mut self.client;
+        remote.feed(client, &mut self.client_read_buf);
+        client.feed(remote, &mut self.client_write_buf);
+    }
+
     fn handleServer(&mut self, event: &mio::event::Event) {
         assert!(self.state == ConnectionState::Transfer);
         let remote = self.remote.as_mut().unwrap();
         if event.is_readable() { remote.drained = false; }
         if event.is_writable() { remote.full = false; }
 
-        loop {
-            remote.read(&mut self.client_write_buf).unwrap(); // FIXME handle
-            self.client.write(&mut self.client_write_buf).unwrap(); // FIXME handle
-
-            self.client.read(&mut self.client_read_buf).unwrap(); // FIXME handle
-            remote.write(&mut self.client_write_buf).unwrap(); // FIXME handle
-        }
+        self.transfer();
     }
 
     fn handleClient(&mut self, ste: &mut ste::Ste, event: &mio::event::Event) {
-        if event.is_readable() {
-            self.client.drained = false;
-        }
-        if event.is_writable() {
-            self.client.full = false;
-        }
+        if event.is_readable() { self.client.drained = false; }
+        if event.is_writable() { self.client.full = false; }
 
-        self.client.read(&mut self.client_read_buf);
-        self.client.write(&mut self.client_write_buf);
+        self.client.read(&mut self.client_read_buf); // FIXME handle
+        self.client.write(&mut self.client_write_buf); // FIXME handle
 
         match self.state {
             ConnectionState::Handshake => {
@@ -270,7 +277,8 @@ impl Connection {
 
                 trace!("Received connect: {:?}", connect);
                 // FIXME write(..).unwrap? seriously?
-                trace!("Written: {}", self.client.pipe.write(&[0x05u8,0x00]).unwrap());
+                let written = self.client.pipe.write(&[0x05u8,0x00]).unwrap();
+                trace!("Written: {}", written);
 
                 self.state = ConnectionState::Request;
             },
@@ -315,16 +323,13 @@ impl Connection {
                 }
 
                 // FIXME write(..).unwrap? seriously?
-                trace!("Written: {}", self.client.pipe.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap());
+                let written = self.client.pipe.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap();
+                trace!("Written: {}", written);
 
                 self.state = ConnectionState::Transfer;
             },
-            ConnectionState::Transfer => {
-                loop {
-                }
-            }
+            ConnectionState::Transfer => self.transfer(),
         }
-
     }
 }
 
