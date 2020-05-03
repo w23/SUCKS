@@ -133,19 +133,19 @@ fn readRequest(buf: &[u8]) -> std::io::Result<Request> {
 
 struct ReadWritePipe<T: Read+Write> {
     pipe: T,
-    drained: bool,
-    full: bool,
+    readable: bool,
+    writable: bool,
 }
 
 impl<T: Read+Write> ReadWritePipe<T> {
     fn new(pipe: T) -> ReadWritePipe<T> {
-        ReadWritePipe{pipe, drained: true, full: true }
+        ReadWritePipe{pipe, readable: false, writable: false }
     }
 
     fn read(&mut self, buffer: &mut RingByteBuffer) -> std::io::Result<usize> {
         let mut total = 0;
         loop {
-            if self.drained { break; }
+            if !self.readable { break; }
             let read = {
                 let buf = buffer.get_free_slot();
                 if buf.len() == 0 { break; }
@@ -154,7 +154,7 @@ impl<T: Read+Write> ReadWritePipe<T> {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
                     Err(e) => return Err(e),
                 };
-                self.drained = read < buf.len();
+                self.readable = read == buf.len();
                 read
             };
             total += read;
@@ -166,7 +166,7 @@ impl<T: Read+Write> ReadWritePipe<T> {
     fn write(&mut self, buffer: &mut RingByteBuffer) -> std::io::Result<usize> {
         let mut total = 0;
         loop {
-            if self.full { break; }
+            if !self.writable { break; }
             let written = {
                 let buf = buffer.get_data();
                 if buf.len() == 0 { break; }
@@ -175,7 +175,7 @@ impl<T: Read+Write> ReadWritePipe<T> {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
                     Err(e) => return Err(e),
                 };
-                self.full = written < buf.len();
+                self.writable = written == buf.len();
                 written
             };
             total += written;
@@ -195,6 +195,59 @@ impl<T: Read+Write> ReadWritePipe<T> {
     }
 }
 
+struct Tcp {
+    pipe: ReadWritePipe<TcpStream>,
+    handle: ste::Handle,
+}
+
+impl Tcp {
+    fn from_stream(ste: &mut ste::Ste, context: ste::Handle, mut stream: TcpStream, token: usize) -> std::io::Result<Tcp> {
+        let handle = ste.register_source(context, &mut stream, token)?;
+        Ok(Tcp {
+            pipe: ReadWritePipe::new(stream),
+            handle
+        })
+    }
+
+    fn connect(ste: &mut ste::Ste, context: ste::Handle, addr: std::net::SocketAddr, token: usize) -> std::io::Result<Tcp> {
+        let mut stream = TcpStream::connect(addr)?;
+        let handle = ste.register_source(context, &mut stream, token)?;
+        Ok(Tcp { pipe: ReadWritePipe::new(stream), handle })
+    }
+
+    fn deregister(&mut self, ste: &mut ste::Ste) {
+        match ste.deregister_source(self.handle, &mut self.pipe.pipe) {
+            Err(e) => { error!("Error deregistering socket: {}", e) },
+            _ => {},
+        }
+    }
+
+    fn update_state(&mut self, event: &mio::event::Event) -> std::io::Result<()> {
+        if event.is_readable() { self.pipe.readable = true; }
+        if event.is_writable() { self.pipe.writable = true; }
+
+        if event.is_read_closed() != event.is_write_closed() {
+            error!("read_closed {} != write_closed {}", event.is_read_closed(), event.is_write_closed());
+        }
+
+        if event.is_read_closed() || event.is_write_closed() {
+            debug!("Remote socket closed");
+            self.pipe.readable = false;
+            self.pipe.writable = false;
+            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, ""));
+        }
+
+        if event.is_error() {
+            error!("Remote socket error");
+            self.pipe.readable = false;
+            self.pipe.writable = false;
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, ""));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(PartialEq)]
 enum ConnectionState {
     Handshake,
@@ -204,11 +257,10 @@ enum ConnectionState {
 
 struct Connection {
     handle: Option<ste::Handle>,
+    lol_socket: Option<TcpStream>,
     state: ConnectionState,
-    client: Option<ReadWritePipe<TcpStream>>,
-    client_handle: Option<ste::Handle>,
-    remote: Option<ReadWritePipe<TcpStream>>,
-    remote_handle: Option<ste::Handle>,
+    client: Option<Tcp>,
+    remote: Option<Tcp>,
     buf_from_client: RingByteBuffer,
     buf_to_client: RingByteBuffer,
 }
@@ -217,7 +269,8 @@ impl ste::Context for Connection {
     fn registered(&mut self, ste: &mut ste::Ste, handle: ste::Handle) {
         info!("Handle: {:?}", handle);
         self.handle = Some(handle);
-        self.client_handle = Some(ste.register_source(handle, &mut self.client.as_mut().unwrap().pipe, 0).unwrap()); // FIXME don't unwrap please
+        let socket = self.lol_socket.take().unwrap();
+        self.client = Some(Tcp::from_stream(ste, handle, socket, 0).unwrap()) // FIXME don't unwrap please
     }
 
     fn event(&mut self, ste: &mut ste::Ste, token: usize, event: &mio::event::Event) {
@@ -226,22 +279,76 @@ impl ste::Context for Connection {
                 match self.handleClient(ste, event) {
                     Err(e) => {
                         error!("Client socket error: {}", e);
-                        self.closeClient(ste);
+                        self.client.take().unwrap().deregister(ste);
                     },
+                    Ok(cont) if !cont => return,
                     _ => {},
                 }
             },
             1 => {
-                match self.handleRemote(ste, event) {
+                let remote = self.remote.as_mut().unwrap();
+                match remote.update_state(event) {
                     Err(e) => {
-                        error!("Client socket error: {}", e);
-                        self.closeRemote(ste);
+                        error!("Remote socket error: {}", e);
+                        remote.deregister(ste);
+                        self.remote = None
                     },
                     _ => {},
                 }
             }
             _ => error!("Unexpected socket token {}", token)
         }
+
+        loop {
+            feed(ste, &mut self.client, &mut self.remote, &mut self.buf_from_client);
+            feed(ste, &mut self.remote, &mut self.client, &mut self.buf_to_client);
+
+            if (self.client.is_none() && self.buf_from_client.is_empty()) ||
+                (self.remote.is_none() && self.buf_to_client.is_empty()) ||
+                (self.client.is_none() && self.remote.is_none())
+            {
+                self.disconnect(ste);
+                return
+            }
+
+            let client_readable = self.client.is_some() && self.client.as_mut().unwrap().pipe.readable;
+            let remote_readable = self.remote.is_some() && self.remote.as_mut().unwrap().pipe.readable;
+            let client_writable = self.client.is_some() && self.client.as_mut().unwrap().pipe.writable;
+            let remote_writable = self.remote.is_some() && self.remote.as_mut().unwrap().pipe.writable;
+
+            if ((!client_readable && self.buf_from_client.is_empty()) || !remote_writable) &&
+                ((!remote_readable && self.buf_to_client.is_empty()) || !client_writable) {
+                    break
+            }
+        }
+    }
+}
+
+fn feed(ste: &mut ste::Ste, source: &mut Option<Tcp>, dest: &mut Option<Tcp>, buf: &mut RingByteBuffer) {
+    match source {
+        Some(tcp) => {
+            match tcp.pipe.read(buf) {
+                Err(e) => {
+                    error!("Error reading socket: {}", e);
+                    tcp.deregister(ste);
+                    *source = None;
+                }, _ => {},
+            }
+        }, _ => {},
+    }
+
+    if buf.is_empty() { return }
+
+    match dest {
+        Some(tcp) => {
+            match tcp.pipe.write(buf) {
+                Err(e) => {
+                    error!("Error writing socket: {}", e);
+                    tcp.deregister(ste);
+                    *dest = None;
+                }, _ => {},
+            }
+        }, _ => {}
     }
 }
 
@@ -249,11 +356,10 @@ impl Connection {
     fn new(client: TcpStream) -> Connection {
         Connection {
             handle: None,
+            lol_socket: Some(client),
             state: ConnectionState::Handshake,
-            client: Some(ReadWritePipe::new(client)),
-            client_handle: None,
+            client: None,
             remote: None,
-            remote_handle: None,
             buf_from_client: RingByteBuffer::new(),
             buf_to_client: RingByteBuffer::new(),
         }
@@ -261,26 +367,12 @@ impl Connection {
 
     fn disconnect_remote(&mut self, ste: &mut ste::Ste) {
         if self.remote.is_none() { return }
-        match ste.deregister_source(self.remote_handle.unwrap(), &mut self.remote.as_mut().unwrap().pipe) {
-            Err(e) => warn!("Couldn't deregister remote socket: {}", e),
-            _ => {},
-        }
-        self.remote_handle = None;
-        self.remote = None;
-
-        if self.client_handle.is_none() {
-            self.disconnect(ste);
-        }
+        self.remote.take().unwrap().deregister(ste);
     }
 
     fn disconnect_client(&mut self, ste: &mut ste::Ste) {
         if self.client.is_none() { return }
-        match ste.deregister_source(self.client_handle.unwrap(), &mut self.client.as_mut().unwrap().pipe) {
-            Err(e) => warn!("Couldn't deregister client socket: {}", e),
-            _ => {},
-        }
-        self.client_handle = None;
-        self.client = None;
+        self.client.take().unwrap().deregister(ste);
     }
 
     fn disconnect(&mut self, ste: &mut ste::Ste) {
@@ -294,97 +386,14 @@ impl Connection {
         }
     }
 
-    fn transfer(&mut self, ste: &mut ste::Ste) {
-        match (self.client.as_mut(), self.remote.as_mut()) {
-            (Some(client), Some(remote)) => {
-                // FIXME cannot reasonably handle errors here, need to warp transfer to outside
-                remote.feed(client, &mut self.buf_from_client);
-                client.feed(remote, &mut self.buf_to_client);
-            },
-            (None, Some(remote)) => {
-                match remote.write(&mut self.buf_from_client) {
-                    Err(e) => {
-                        error!("Remote socket error: {}", e);
-                        self.closeRemote(ste);
-                    },
-                    _ => {},
-                }
-            },
-            (Some(client), None) => {
-                match client.write(&mut self.buf_to_client) {
-                    Err(e) => {
-                        error!("Client socket error: {}", e);
-                        self.closeClient(ste);
-                    },
-                    _ => {},
-                }
-            },
-            (_, _) => {},
-        }
-    }
-
-    fn handleRemote(&mut self, ste: &mut ste::Ste, event: &mio::event::Event) -> std::io::Result<()> {
-        assert!(self.state == ConnectionState::Transfer);
-        let remote = self.remote.as_mut().unwrap();
-        if event.is_readable() { remote.drained = false; }
-        if event.is_writable() { remote.full = false; }
-
-        if event.is_read_closed() != event.is_write_closed() {
-            error!("read_closed {} != write_closed {}", event.is_read_closed(), event.is_write_closed());
-        }
-
-        if event.is_read_closed() || event.is_write_closed() {
-            debug!("Remote socket closed");
-            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, ""));
-        }
-
-        if event.is_error() {
-            error!("Remote socket error");
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, ""));
-        }
-
-        self.transfer(ste);
-        Ok(())
-    }
-
-    fn closeRemote(&mut self, ste: &mut ste::Ste) {
-        if self.client.is_none() || self.buf_to_client.is_empty() {
-            self.disconnect(ste);
-        } else {
-            self.disconnect_remote(ste);
-        }
-    }
-
-    fn closeClient(&mut self, ste: &mut ste::Ste) {
-        if self.remote.is_none() || self.buf_from_client.is_empty() {
-            self.disconnect(ste);
-        } else {
-            self.disconnect_client(ste);
-        }
-    }
-
-    fn handleClient(&mut self, ste: &mut ste::Ste, event: &mio::event::Event) -> std::io::Result<()> {
+    fn handleClient(&mut self, ste: &mut ste::Ste, event: &mio::event::Event) -> std::io::Result<bool> {
         let client = self.client.as_mut().unwrap();
-        if event.is_readable() { client.drained = false; }
-        if event.is_writable() { client.full = false; }
-
-        if event.is_read_closed() != event.is_write_closed() {
-            error!("read_closed {} != write_closed {}", event.is_read_closed(), event.is_write_closed());
-        }
-
-        if event.is_read_closed() || event.is_write_closed() {
-            debug!("Client socket closed");
-            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, ""));
-        }
-
-        if event.is_error() {
-            error!("Client socket error");
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, ""));
-        }
-
-        client.read(&mut self.buf_from_client)?;
-
+        client.update_state(event)?;
+        client.pipe.read(&mut self.buf_from_client)?;
         match self.state {
+            ConnectionState::Transfer => {
+                return Ok(true)
+            }
             ConnectionState::Handshake => {
                 let buf = self.buf_from_client.get_data();
                 let connect = match readConnect(buf) {
@@ -408,50 +417,27 @@ impl Connection {
                 // FIXME consume properly
                 let to_drop = buf.len();
                 self.buf_from_client.consume(to_drop);
-
                 info!("Read request: {:?}", request);
 
-                self.remote = Some(match TcpStream::connect(request.socket_addr()) {
-                    Ok(socket) => ReadWritePipe::new(socket),
-                    Err(e) => {
-                        error!("Cannot connect to remote {:?}: {:?}", request, e);
-                        unimplemented!();
-                    }
-                });
-
-                self.remote_handle = match ste.register_source(self.handle.unwrap(), &mut self.remote.as_mut().unwrap().pipe, 1) {
-                    Err(e) => {
-                        error!("Cannot register remote socket {:?}: {:?}", request, e);
-                        unimplemented!();
-                    },
-                    Ok(handle) => Some(handle),
-                };
-
+                self.remote = Some(Tcp::connect(ste, self.handle.unwrap(), request.socket_addr(), 1)?);
                 self.buf_to_client.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap();
                 self.state = ConnectionState::Transfer;
             },
-            ConnectionState::Transfer => {
-                self.transfer(ste);
-                return Ok(()) // to avoid write below
-            }
         }
-
-        match client.write(&mut self.buf_to_client) {
-            Err(e) => Err(e),
-            Ok(_) => Ok(()),
-        }
+        client.pipe.write(&mut self.buf_to_client)?;
+        Ok(false)
     }
 }
 
 struct ListenContext {
-    socket: mio::net::TcpListener,
+    socket: TcpListener,
 }
 
 impl ListenContext {
     fn listen(bind_addr: &str) -> Result<ListenContext, std::io::Error> {
         let listen_addr = bind_addr.to_socket_addrs()?.next().unwrap();
         Ok(ListenContext{
-            socket: mio::net::TcpListener::bind(listen_addr)?
+            socket: TcpListener::bind(listen_addr)?
         })
     }
 }
@@ -497,10 +483,5 @@ pub fn main(listen: &str, exit: &str) -> Result<(), Box<dyn std::error::Error>> 
     let mut ste = ste::Ste::new(128).unwrap();
 
     let _context_handle = ste.register_context(Box::new(ListenContext::listen(listen)?))?;
-    //let context = ste.get_context(context_handle)?;
-
-    //let listen = ste.listen(listen, context_handle);
-    //info!("Listening socket: {:?}", listen);
-
     ste.run()
 }
