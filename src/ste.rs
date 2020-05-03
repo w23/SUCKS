@@ -229,61 +229,6 @@ impl Ste {
         Ok(())
     }
 
-    // FIXME deregister:
-    // -- all sources by context?
-    // -- source by handle?
-    // O(N) :((( or index
-
-    // fn handleListener(&mut self, socket_handle: SocketHandle, event: &mio::event::Event) {
-    //     let socket = match get_ref_by_handle(&self.listeners, socket_handle) {
-    //         Some(sock) => sock,
-    //         None => return,
-    //     };
-    //
-    // }
-    //
-    // TODO: need to separate missing socket and missing context
-    // fn get_socket_context_mut(&mut self, socket_handle: SocketHandle) -> Option<&mut Box<dyn Context>> {
-    //     let socket = match get_ref_by_handle(&self.listeners, socket_handle) {
-    //         Some(sock) => sock,
-    //         None => return None,
-    //     };
-    //
-    //     get_ref_mut_by_handle(&mut self.contexts, socket.context)
-    // }
-
-    // fn handleStream(&mut self, socket_handle: SocketHandle, event: &mio::event::Event) {
-    //     let socket = match get_ref_mut_by_handle(&mut self.streams, socket_handle) {
-    //         Some(sock) => sock,
-    //         None => return,
-    //     };
-    //
-    //     let context = match get_ref_mut_by_handle(&mut self.contexts, socket.context) {
-    //         Some(context) => context,
-    //         None => {
-    //             error!("C{} is stale, but associated socket still exists", socket.context.index);
-    //             unimplemented!("FIXME this socket should die now");
-    //             //return;
-    //         }
-    //     };
-    //
-    //     if event.is_error() {
-    //         unimplemented!();
-    //     }
-    //
-    //     if event.is_readable() {
-    //         let buf = context.get_buffer();
-    //         let read = match socket.socket.read(buf) {
-    //             Ok(read) => read,
-    //             Err(e) => {
-    //                 error!("Error: {:?}", e);
-    //                 0
-    //             },
-    //         };
-    //         context.buffer_read(self, read);
-    //     }
-    // }
-
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut events = Events::with_capacity(128);
 
