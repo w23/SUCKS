@@ -1,4 +1,3 @@
-//use std::thread;
 use std::cell::RefCell;
 use log::{self, Record, Level, Metadata};
 
@@ -33,13 +32,14 @@ impl Drop for Context {
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
+            let now = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
             PREFIX.with(|p| {
-                println!("{}{} - {}", p.borrow(), record.level(), record.args());
+                println!("{} {} {} - {}", now, p.borrow(), record.level(), record.args());
             });
         }
     }

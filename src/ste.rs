@@ -51,6 +51,12 @@ pub struct Handle {
     seq: usize,
 }
 
+impl std::fmt::Display for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "({}, {})", self.seq, self.index)
+    }
+}
+
 impl From<Token> for Handle {
     fn from(token: Token) -> Handle {
         Handle{
@@ -253,12 +259,12 @@ impl Ste {
                     }
                 };
 
-                debug!("context={:?}", mapping.context);
+                debug!("context={}", mapping.context);
 
                 let context = match self.contexts.get_ref_mut_by_handle(mapping.context) {
                     Some(context) => context.clone(),
                     None => {
-                        warn!("Stale context handle {:?}", mapping.context);
+                        warn!("Stale context handle {}", mapping.context);
                         // TODO: unregister?
                         continue;
                     }
