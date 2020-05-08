@@ -275,9 +275,10 @@ impl ste::Context for Connection {
     }
 
     fn event(&mut self, ste: &mut ste::Ste, token: usize, event: &mio::event::Event) {
-        let _lctx = log::Context::new(format!("C{:?}: ", self.handle.unwrap()));
+        let _lctx = log::Context::new(format!("C{}: ", self.handle.unwrap()));
         match token {
             0 => {
+                trace!("client");
                 match self.handleClient(ste, event) {
                     Err(e) => {
                         error!("Client socket error: {}", e);
@@ -288,6 +289,7 @@ impl ste::Context for Connection {
                 }
             },
             1 => {
+                trace!("remote");
                 let remote = self.remote.as_mut().unwrap();
                 match remote.update_state(event) {
                     Err(e) => {
@@ -302,8 +304,10 @@ impl ste::Context for Connection {
         }
 
         loop {
-            feed(ste, &mut self.client, &mut self.remote, &mut self.buf_from_client);
-            feed(ste, &mut self.remote, &mut self.client, &mut self.buf_to_client);
+            let c2r = feed(ste, &mut self.client, &mut self.remote, &mut self.buf_from_client);
+            trace!("client to remote {:?}", c2r);
+            let r2c = feed(ste, &mut self.remote, &mut self.client, &mut self.buf_to_client);
+            trace!("remote to client {:?}", r2c);
 
             if (self.client.is_none() && self.buf_from_client.is_empty()) ||
                 (self.remote.is_none() && self.buf_to_client.is_empty()) ||
@@ -326,7 +330,9 @@ impl ste::Context for Connection {
     }
 }
 
-fn feed(ste: &mut ste::Ste, source: &mut Option<Tcp>, dest: &mut Option<Tcp>, buf: &mut RingByteBuffer) {
+fn feed(ste: &mut ste::Ste, source: &mut Option<Tcp>, dest: &mut Option<Tcp>, buf: &mut RingByteBuffer) -> (usize, usize) {
+    let mut received = 0;
+    let mut sent = 0;
     match source {
         Some(tcp) => {
             match tcp.pipe.read(buf) {
@@ -334,12 +340,12 @@ fn feed(ste: &mut ste::Ste, source: &mut Option<Tcp>, dest: &mut Option<Tcp>, bu
                     error!("Error reading socket: {}", e);
                     tcp.deregister(ste);
                     *source = None;
-                }, _ => {},
+                }, Ok(read) => { received += read; },
             }
         }, _ => {},
     }
 
-    if buf.is_empty() { return }
+    if buf.is_empty() { return (received, 0) }
 
     match dest {
         Some(tcp) => {
@@ -348,10 +354,12 @@ fn feed(ste: &mut ste::Ste, source: &mut Option<Tcp>, dest: &mut Option<Tcp>, bu
                     error!("Error writing socket: {}", e);
                     tcp.deregister(ste);
                     *dest = None;
-                }, _ => {},
+                }, Ok(written) => { sent += written; },
             }
         }, _ => {}
     }
+
+    return (received, sent)
 }
 
 impl Connection {
