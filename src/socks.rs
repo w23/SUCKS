@@ -10,12 +10,13 @@ use {
             TcpStream, TcpListener,
         },
     },
-    log::{info, trace, warn, error, debug},
+    ::log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
 
 use crate::ringbuf::RingByteBuffer;
 use crate::ste;
+use crate::log;
 
 #[derive(Debug)]
 struct Connect {
@@ -274,6 +275,7 @@ impl ste::Context for Connection {
     }
 
     fn event(&mut self, ste: &mut ste::Ste, token: usize, event: &mio::event::Event) {
+        let _lctx = log::Context::new(format!("C{:?}: ", self.handle.unwrap()));
         match token {
             0 => {
                 match self.handleClient(ste, event) {

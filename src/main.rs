@@ -6,6 +6,7 @@ mod socks;
 mod exit;
 mod ste;
 mod ringbuf;
+mod log;
 
 /*
 #[derive(Debug)]
@@ -29,8 +30,14 @@ impl std::fmt::Display for SimpleError {
 impl std::error::Error for SimpleError {}
 */
 
+static LOGGER: log::Logger = log::Logger;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    // env_logger::init();
+    ::log::set_logger(&LOGGER)
+                .map(|()| ::log::set_max_level(::log::LevelFilter::Trace)).unwrap();
+
+    let _logctx = log::Context::new("QEQ".to_string());
 
     let args: Vec<String> = env::args().collect();
     socks::main(&args[1], args.get(2).unwrap_or(&String::from("")))
