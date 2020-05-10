@@ -12,6 +12,7 @@ byteorder = "1.3.2"
 mio = {version = "0.7", features = ["os-poll", "tcp"]}
 ochenslab = "0.0.2"
 log = "0.4"
+circbuf = "0.1"
 
 # [dependencies.env_logger]
 # default-features = false

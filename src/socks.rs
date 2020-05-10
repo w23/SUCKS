@@ -1,7 +1,7 @@
 use {
     std::{
         // cell::{RefCell},
-        io::{Write, Read, Cursor, Seek},
+        io::{Write, Read, Cursor, Seek, IoSlice, IoSliceMut},
         net::{IpAddr, ToSocketAddrs},
         // rc::Rc,
     },
@@ -10,11 +10,11 @@ use {
             TcpStream, TcpListener,
         },
     },
+    circbuf::CircBuf,
     ::log::{info, trace, warn, error, debug},
 };
 use byteorder::{NetworkEndian, ReadBytesExt};
 
-use crate::ringbuf::RingByteBuffer;
 use crate::ste;
 use crate::log;
 
@@ -143,55 +143,45 @@ impl<T: Read+Write> ReadWritePipe<T> {
         ReadWritePipe{pipe, readable: false, writable: false }
     }
 
-    fn read(&mut self, buffer: &mut RingByteBuffer) -> std::io::Result<usize> {
-        let mut total = 0;
-        loop {
-            if !self.readable { break; }
-            let read = {
-                let buf = buffer.get_free_slot();
-                if buf.len() == 0 { break; }
-                let read = match self.pipe.read(buf) {
-                    Ok(size) => size,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
-                    Err(e) => return Err(e),
-                };
-                self.readable = read == buf.len();
-                read
-            };
-            total += read;
-            buffer.produce(read);
+    fn read(&mut self, buffer: &mut CircBuf) -> std::io::Result<usize> {
+        if buffer.cap() == 0 { return Ok(0) }
+        let [buf1, buf2] = buffer.get_avail();
+        let mut bufs = [IoSliceMut::new(buf1), IoSliceMut::new(buf2)];
+        match self.pipe.read_vectored(&mut bufs) {
+            Ok(0) => {
+                self.readable = false;
+                Ok(0)
+            },
+            Ok(read) => {
+                buffer.advance_write(read);
+                Ok(read)
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.readable = false;
+                Ok(0)
+            },
+            Err(e) => Err(e),
         }
-        Ok(total)
     }
 
-    fn write(&mut self, buffer: &mut RingByteBuffer) -> std::io::Result<usize> {
-        let mut total = 0;
-        loop {
-            if !self.writable { break; }
-            let written = {
-                let buf = buffer.get_data();
-                if buf.len() == 0 { break; }
-                let written = match self.pipe.write(buf) {
-                    Ok(size) => size,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; },
-                    Err(e) => return Err(e),
-                };
-                self.writable = written == buf.len();
-                written
-            };
-            total += written;
-            buffer.consume(written);
-        }
-        Ok(total)
-    }
-
-    fn feed<U: Read+Write>(&mut self, from: &mut ReadWritePipe<U>, buffer: &mut RingByteBuffer) -> (std::io::Result<usize>, std::io::Result<usize>) {
-        // FIXME compute sum of all sent
-        loop {
-            let ret = (from.read(buffer), self.write(buffer));
-            if ret.0.is_err() || ret.1.is_err() || *ret.0.as_ref().ok().unwrap() == 0 || *ret.1.as_ref().ok().unwrap() == 0 {
-                return ret;
-            }
+    fn write(&mut self, buffer: &mut CircBuf) -> std::io::Result<usize> {
+        if buffer.len() == 0 { return Ok(0) }
+        let bufs = buffer.get_bytes();
+        let bufs = [IoSlice::new(&bufs[0]), IoSlice::new(&bufs[1])];
+        match self.pipe.write_vectored(&bufs) {
+            Ok(0) => {
+                self.writable = false;
+                Ok(0)
+            },
+            Ok(written) => {
+                buffer.advance_read(written);
+                Ok(written)
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.writable = false;
+                Ok(0)
+            },
+            Err(e) => Err(e),
         }
     }
 }
@@ -224,6 +214,7 @@ impl Tcp {
     }
 
     fn update_state(&mut self, event: &mio::event::Event) -> std::io::Result<()> {
+        trace!("readable {} -> {}, writable {} -> {}", self.pipe.readable, event.is_readable(), self.pipe.writable, event.is_writable());
         if event.is_readable() { self.pipe.readable = true; }
         if event.is_writable() { self.pipe.writable = true; }
 
@@ -262,8 +253,8 @@ struct Connection {
     state: ConnectionState,
     client: Option<Tcp>,
     remote: Option<Tcp>,
-    buf_from_client: RingByteBuffer,
-    buf_to_client: RingByteBuffer,
+    buf_from_client: CircBuf,
+    buf_to_client: CircBuf,
 }
 
 impl ste::Context for Connection {
@@ -275,10 +266,10 @@ impl ste::Context for Connection {
     }
 
     fn event(&mut self, ste: &mut ste::Ste, token: usize, event: &mio::event::Event) {
-        let _lctx = log::Context::new(format!("C{}: ", self.handle.unwrap()));
+        log_scope!(format!("C{}: ", self.handle.unwrap()));
         match token {
             0 => {
-                trace!("client");
+                log_scope!("client: ");
                 match self.handleClient(ste, event) {
                     Err(e) => {
                         error!("Client socket error: {}", e);
@@ -289,7 +280,7 @@ impl ste::Context for Connection {
                 }
             },
             1 => {
-                trace!("remote");
+                log_scope!("remote: ");
                 let remote = self.remote.as_mut().unwrap();
                 match remote.update_state(event) {
                     Err(e) => {
@@ -304,10 +295,14 @@ impl ste::Context for Connection {
         }
 
         loop {
-            let c2r = feed(ste, &mut self.client, &mut self.remote, &mut self.buf_from_client);
-            trace!("client to remote {:?}", c2r);
-            let r2c = feed(ste, &mut self.remote, &mut self.client, &mut self.buf_to_client);
-            trace!("remote to client {:?}", r2c);
+            {
+                log_scope!("client -> remote: ");
+                feed(ste, &mut self.client, &mut self.remote, &mut self.buf_from_client);
+            }
+            {
+                log_scope!("remote -> client: ");
+                feed(ste, &mut self.remote, &mut self.client, &mut self.buf_to_client);
+            }
 
             if (self.client.is_none() && self.buf_from_client.is_empty()) ||
                 (self.remote.is_none() && self.buf_to_client.is_empty()) ||
@@ -330,37 +325,40 @@ impl ste::Context for Connection {
     }
 }
 
-fn feed(ste: &mut ste::Ste, source: &mut Option<Tcp>, dest: &mut Option<Tcp>, buf: &mut RingByteBuffer) -> (usize, usize) {
-    let mut received = 0;
-    let mut sent = 0;
-    match source {
+fn feed(ste: &mut ste::Ste, source: &mut Option<Tcp>, dest: &mut Option<Tcp>, buf: &mut CircBuf) {
+    let received = match source {
         Some(tcp) => {
             match tcp.pipe.read(buf) {
                 Err(e) => {
                     error!("Error reading socket: {}", e);
                     tcp.deregister(ste);
                     *source = None;
-                }, Ok(read) => { received += read; },
+                    0
+                }, Ok(read) => read,
             }
-        }, _ => {},
-    }
+        }, _ => 0,
+    };
+    debug!("received: {} to buffer: {}", received, buf.len());
+    if buf.is_empty() { return }
 
-    if buf.is_empty() { return (received, 0) }
-
-    match dest {
+    let sent = match dest {
         Some(tcp) => {
             match tcp.pipe.write(buf) {
                 Err(e) => {
                     error!("Error writing socket: {}", e);
                     tcp.deregister(ste);
                     *dest = None;
-                }, Ok(written) => { sent += written; },
+                    0
+                }, Ok(written) => written,
             }
-        }, _ => {}
-    }
+        }, _ => 0
+    };
 
-    return (received, sent)
+    debug!("sent: {}, left in buffer: {}", sent, buf.len());
 }
+
+
+const TEST_BUFFER_SIZE: usize = 8192;
 
 impl Connection {
     fn new(client: TcpStream) -> Connection {
@@ -370,8 +368,8 @@ impl Connection {
             state: ConnectionState::Handshake,
             client: None,
             remote: None,
-            buf_from_client: RingByteBuffer::new(),
-            buf_to_client: RingByteBuffer::new(),
+            buf_from_client: CircBuf::with_capacity(TEST_BUFFER_SIZE).unwrap(),
+            buf_to_client: CircBuf::with_capacity(TEST_BUFFER_SIZE).unwrap(),
         }
     }
 
@@ -405,12 +403,12 @@ impl Connection {
                 return Ok(true)
             }
             ConnectionState::Handshake => {
-                let buf = self.buf_from_client.get_data();
+                let buf = self.buf_from_client.get_bytes()[0];
                 let connect = match readConnect(buf) {
                     Some(connect) => {
                         // FIXME consume properly
                         let to_drop = buf.len();
-                        self.buf_from_client.consume(to_drop);
+                        self.buf_from_client.advance_read(to_drop);
                         connect
                     },
                     None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid SOCKS handshake")),
@@ -422,11 +420,11 @@ impl Connection {
             },
             ConnectionState::Request => {
                 // TODO: handle buffer wraparound
-                let buf = self.buf_from_client.get_data();
+                let buf = self.buf_from_client.get_bytes()[0];
                 let request = readRequest(buf)?;
                 // FIXME consume properly
                 let to_drop = buf.len();
-                self.buf_from_client.consume(to_drop);
+                self.buf_from_client.advance_read(to_drop);
                 info!("Read request: {:?}", request);
 
                 self.remote = Some(Tcp::connect(ste, self.handle.unwrap(), request.socket_addr(), 1)?);

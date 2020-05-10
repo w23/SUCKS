@@ -1,22 +1,16 @@
 use {
     std::{
-        //borrow::{BorrowMut},
         cell::RefCell,
         rc::Rc,
-        io::{Write, Read},
-        net::{/*IpAddr,*/ ToSocketAddrs},
-        // ops::DerefMut,
     },
     mio::{
         Events, Poll, Token,
-        // net::{
-        //     UdpSocket,
-        //     TcpStream, TcpListener,
-        // },
     },
-    log::{info, trace, warn, error, debug},
+    ::log::{info, trace, warn, error, debug},
     ochenslab::OchenSlab,
 };
+
+use crate::log;
 
 struct Versioned<T> {
     seq: usize,
@@ -53,7 +47,7 @@ pub struct Handle {
 
 impl std::fmt::Display for Handle {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "({}, {})", self.seq, self.index)
+        write!(f, "{}i{}", self.seq, self.index)
     }
 }
 
@@ -236,6 +230,7 @@ impl Ste {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        log_scope!("ste::run: ");
         let mut events = Events::with_capacity(128);
 
         loop {
@@ -249,7 +244,12 @@ impl Ste {
             }
 
             for event in &events {
-                debug!("event: {:?}", event);
+                trace!("event: {:?}", event);
+                log_scope!(format!("{}{}{}: ",
+                    if event.is_readable() { 'R' } else { '_' },
+                    if event.is_writable() { 'W' } else { '_' },
+                    if event.is_error() { 'E' } else { '_' }
+                    ));
                 let mapping = match self.mapping.get_ref_by_handle(Handle::from(event.token())) {
                     Some(mapping) => mapping,
                     None => {
