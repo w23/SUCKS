@@ -9,10 +9,11 @@ edition = "2018"
 [dependencies]
 chrono = "0.4"
 byteorder = "1.3.2"
-mio = {version = "0.7", features = ["os-poll", "tcp"]}
+mio = {version = "0.7", features = ["os-poll", "tcp", "udp"]}
 ochenslab = "0.0.2"
 log = "0.4"
 circbuf = "0.1"
+simple-error = "0.2"
 
 # [dependencies.env_logger]
 # default-features = false

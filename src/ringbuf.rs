@@ -84,9 +84,3 @@ impl std::io::Write for RingByteBuffer {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-}

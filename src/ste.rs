@@ -209,9 +209,9 @@ impl Ste {
 
     // TODO RegisteredSource type?
     pub fn deregister_source(&mut self, source_handle: Handle, source: &mut dyn mio::event::Source) -> std::io::Result<()> {
-        let mapping = match self.mapping.get_ref_by_handle(source_handle) {
+        match self.mapping.get_ref_by_handle(source_handle) {
             None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "Source not found")),
-            Some(mapping) => mapping,
+            Some(_) => {},
         };
 
         self.mapping.slab.remove(source_handle.index);

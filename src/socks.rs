@@ -1,6 +1,5 @@
 use {
     std::{
-        // cell::{RefCell},
         io::{Write, Read, Cursor, Seek, IoSlice, IoSliceMut},
         net::{IpAddr, ToSocketAddrs},
         // rc::Rc,
@@ -427,6 +426,7 @@ impl Connection {
                 self.buf_from_client.advance_read(to_drop);
                 info!("Read request: {:?}", request);
 
+                // TODO DNS
                 self.remote = Some(Tcp::connect(ste, self.handle.unwrap(), request.socket_addr(), 1)?);
                 self.buf_to_client.write(&[0x05u8,0x00,0x00,0x01,0,0,0,0,0,0]).unwrap();
                 self.state = ConnectionState::Transfer;
@@ -443,6 +443,7 @@ struct ListenContext {
 
 impl ListenContext {
     fn listen(bind_addr: &str) -> Result<ListenContext, std::io::Error> {
+        // TODO DNS
         let listen_addr = bind_addr.to_socket_addrs()?.next().unwrap();
         Ok(ListenContext{
             socket: TcpListener::bind(listen_addr)?
@@ -459,7 +460,6 @@ impl ste::Context for ListenContext {
         debug!("token:{}, event:{:?}", token, event);
 
         // FIXME if error
-
         if !event.is_readable() {
             error!("what");
             return;
